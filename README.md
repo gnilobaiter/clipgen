@@ -1,0 +1,210 @@
+# 🎬 Clip Generator
+
+[![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch CUDA](https://img.shields.io/badge/CUDA-12.6%20Accelerated-76B900?logo=nvidia&logoColor=white)](https://pytorch.org/)
+[![Code Style: Ruff](https://img.shields.io/badge/Code%20Style-Ruff-black?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
+[![GUI: CustomTkinter](https://img.shields.io/badge/GUI-CustomTkinter-blue)](https://github.com/TomSchimansky/CustomTkinter)
+
+An automated, hardware-accelerated, AI-driven highlight extraction and video clipping workstation for content creators, streamers, and video editors.
+
+**Clip Generator** ingests full-length livestream VODs or local recordings (OBS, gameplay, podcasts), extracts multi-track audio, runs high-speed local GPU transcription with sound dynamics analysis (screaming, combat transients, laughing fits), and prompts modern large language models (Google Gemini, Anthropic Claude, OpenAI, xAI Grok, DeepSeek) to pinpoint the most engaging, hilarious, and viral moments. Extracted clips are rendered with NVENC/CUDA GPU acceleration, vertical 9:16 auto-cropping, VR deshake stabilization, and thumbnail generation.
+
+---
+
+## 🌟 Key Features
+
+### 🎙️ Audio Intelligence & Local Whisper
+* **100% Free Local GPU Transcription:** Runs OpenAI's Whisper model directly on your NVIDIA GPU (`cuda` / `fp16`) or CPU fallback. Zero transcription API costs.
+* **Deterministic Disk Caching:** Transcriptions are automatically hashed and cached on disk (`%APPDATA%/jBahrsClipGenerator/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing.
+* **Audio Dynamics & Peak Loudness Mapping:** Computes RMS loudness for each audio chunk to identify scream-worthy jump scares, chaotic volume spikes, and loud laughing fits (`[LOUDNESS: 100%]`).
+* **Combat & Transient Action Detection:** Detects sharp percussive transients (gunshots, explosions, sudden hits) and tags them as `[ACTION: COMBAT]` so the AI detects action even during quiet gameplay.
+* **Multi-Track OBS Downmixing:** Automatically inspects multi-track containers via `ffprobe` and downmixes all channels (Mic, Discord, Game) via FFmpeg `amix` to ensure no speech is lost.
+
+### 🧠 Multi-Provider LLM Highlight Detection
+* **Full-Context Analysis (No Chunking):** Feeds whole multi-hour transcripts (up to 2M+ tokens) to the AI at once for complete narrative awareness and context retention.
+* **Universal Model Support:** Native, direct API clients with automatic fallback:
+  * **Google Gemini:** `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash`, `gemini-3-pro` (Recommended for massive token context).
+  * **Anthropic Claude:** `claude-3-5-sonnet`, `claude-3-5-haiku`, `claude-3-7-sonnet`.
+  * **OpenAI:** `gpt-4o`, `gpt-4o-mini`, `o1`, `o3-mini`.
+  * **xAI:** `grok-2-latest`, `grok-2-mini`.
+  * **DeepSeek & OpenRouter:** `deepseek-v4-flash`, `deepseek-v4-pro`, or any custom OpenAI-compatible endpoint.
+* **Dynamic Model Discovery:** Automatically queries provider endpoints in the background to keep the model picker updated with the latest available releases.
+* **Configurable Prompt Profiles:** Built-in fine-tuned prompts with virality scoring (1–10), comedic setup-payoff timing, and explicit `"clip it"` voice-command recognition.
+
+### ⚡ GPU-Accelerated Video Pipeline
+* **Hardware Encoding (NVENC / AMF / CUDA):** Renders output MP4 clips using dedicated hardware encoders (`h264_nvenc`) for blazing-fast export speeds.
+* **Vertical 9:16 Auto-Cropping:** Ready-to-publish exports for TikTok, YouTube Shorts, and Instagram Reels:
+  * *Standard Center Crop*
+  * *Left-Third (Facecam)*
+  * *Right-Third*
+  * *Blurred Background (Portrait)*
+  * *Custom Coordinate Crop*
+* **VR Deshake Filter:** Optional post-processing filter to stabilize jittery head-tracking motion in VR gameplay recordings.
+* **Thumbnail & Metadata Generation:** Automatically produces `.jpg` poster frames and `.json` sidecars containing timestamps, duration, virality score, and AI justification for each clip.
+
+### 🖥️ Desktop Workstation
+* **Modern Dark UI:** Built with CustomTkinter for a sleek, responsive interface.
+* **Batch Video Clipper:** Select and process local video files or recordings in an efficient queue.
+* **Built-in Clip Gallery:** Review clips directly in the application, sort by Date or Virality Score, view AI reasoning notes, play video highlights, and batch delete unwanted cuts.
+* **Discord Webhook Alerts:** Sends rich notifications to your Discord channels when clipping jobs complete.
+
+---
+
+## 🏗️ Architecture & Pipeline
+
+```mermaid
+flowchart LR
+    A[Raw Local Video / Recording] --> B[FFmpeg Audio Ingestion]
+    B -->|amix Multi-Track| C[16kHz PCM Buffer]
+    C --> D[Local GPU Whisper]
+    C --> E[RMS Peak & Combat Analysis]
+    D & E --> F[Annotated Transcript]
+    F --> G[LLM Highlight Extraction]
+    G -->|JSON Timestamps & Virality Scores| H[GPU FFmpeg Video Engine]
+    H -->|NVENC + 9:16 Crop + VR Deshake| I[Rendered MP4 Clips]
+    H --> J[Thumbnails & JSON Metadata]
+    I & J --> K[Clip Gallery / Discord Webhook]
+```
+
+---
+
+## 📋 System Requirements & Prerequisites
+
+### Minimum Requirements
+* **Operating System:** Windows 10/11 (64-bit)
+* **Python:** 3.10, 3.11, 3.12, or 3.13
+* **Package Manager:** [`uv`](https://github.com/astral-sh/uv) (strongly recommended) and `make`
+
+### Hardware Recommendations
+* **GPU:** NVIDIA GeForce RTX / GTX series (with CUDA 12.x support) for local Whisper acceleration (`fp16`) and NVENC video exports.
+* **RAM:** 16 GB+
+* **Disk Space:** High-speed SSD storage for video scratch buffers and caches.
+
+### Required External Binaries
+The application expects the following helper executables inside the `bin/` folder (or available in your system `PATH`):
+
+| Binary | Purpose | Download Source |
+| :--- | :--- | :--- |
+| `ffmpeg.exe` | Video cutting, encoding, audio filters | [gyan.dev FFmpeg Builds](https://www.gyan.dev/ffmpeg/builds/) |
+| `ffprobe.exe` | Audio/video stream inspection | Included with FFmpeg |
+
+---
+
+## 🚀 Installation & Quick Start
+
+### 1. Clone the Repository
+```bash
+git clone https://github.com/jBahrVR/jBahrs-Clip-Generator.git
+cd jBahrs-Clip-Generator
+```
+
+### 2. Place External Binaries
+Ensure `ffmpeg.exe` and `ffprobe.exe` are located in the `bin/` directory:
+```
+jBahrs-Clip-Generator/
+├── bin/
+│   ├── ffmpeg.exe
+│   └── ffprobe.exe
+```
+
+### 3. Setup with `make` (Recommended)
+
+This project uses `make` and `uv` for virtual environment management, PyTorch CUDA wheel resolution, and dependency isolation.
+
+```powershell
+# Create virtual environment and install all runtime + dev dependencies:
+make install
+
+# Launch the application:
+make run
+```
+
+---
+
+### 🛠️ Alternative: Manual Setup (without `make`)
+
+If `make` is not installed on your system, you can use `uv` directly:
+
+```powershell
+# 1. Create a virtual environment
+uv venv .venv
+
+# 2. Activate virtual environment
+.venv\Scripts\activate
+
+# 3. Install dependencies with PyTorch CUDA 12.4 support
+uv pip install --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
+
+# 4. Launch the application
+python main.py
+```
+
+---
+
+## 🧪 Development, Code Quality & Tests
+
+Run the complete test suite, coverage reporting, linter, and dead-code analysis with a single command:
+
+```powershell
+make test
+```
+
+This target executes:
+1. **Pytest Test Suite with Coverage:** `python -m pytest -v --cov=src --cov=main --cov-report=term-missing tests/`
+2. **Ruff Linter & Formatter Check:** `python -m ruff check main.py src tests`
+3. **Dead Code Analysis:** `python -m vulture main.py src tests --min-confidence 80 --ignore-names event,icon,cls`
+
+---
+
+## 📖 Usage Guide
+
+### 1. Initial Configuration
+1. Launch the application (`make run`).
+2. Navigate to the **⚙️ Settings** tab.
+3. Configure your paths:
+   * **Generated Clips Directory:** Destination folder for exported highlight clips.
+4. Add your API Key(s) under the **AI Providers** section:
+   * **Google AI Studio (Gemini):** *Recommended* for multi-hour recordings due to the massive context window (2M tokens).
+   * **Anthropic / OpenAI / xAI / DeepSeek:** Supported out-of-the-box.
+5. Click **"Save Settings"** to persist changes.
+
+### 2. Video Highlight Extraction
+1. Go to the **🎬 Clip Extractor** tab.
+2. Select local video file(s) (`.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`) using the **Browse Files** button or enter file paths.
+3. Choose the active **Prompt Profile** in Prompt Manager and **Whisper Model** (`tiny`, `base`, `small`, `medium`, `large`).
+4. Click **"Process Files"** to begin analysis and export.
+
+### 3. Clip Gallery
+1. Go to the **🖼️ Clip Gallery** tab.
+2. Sort extracted clips by **Date** or **Virality Score**.
+3. Select any item to view generated thumbnails, audio duration, and the AI's written justification.
+4. Click **▶️ Play Clip** to preview the cut in your default media player.
+
+---
+
+## ⚙️ Configuration Reference
+
+Application settings and cached data are stored in `%APPDATA%/jBahrsClipGenerator/`:
+* `config.json` — Active provider, model preferences, crop dimensions, and storage paths.
+* `transcripts/` — Cached Whisper JSON transcripts indexed by video metadata hashes.
+* `logs/` — Timestamped execution and error logs.
+
+---
+
+## 💡 Model Recommendations
+
+| Provider | Model | Best For | Notes |
+| :--- | :--- | :--- | :--- |
+| **Google** | `gemini-2.5-flash` / `gemini-3-flash` | **All-round Best** | 1M–2M context window handles 4+ hour VODs seamlessly at high speed. |
+| **Anthropic** | `claude-3-5-sonnet` | **High Precision** | Exceptional nuanced comedy and banter comprehension. |
+| **DeepSeek** | `deepseek-v4-flash` | **Budget / Value** | Cost-effective extraction via official API or OpenRouter. |
+| **OpenAI** | `gpt-4o` | **General Gaming** | Ensure your account tier supports large token requests. |
+| **xAI** | `grok-2-latest` | **Edgy / Fast Comedy** | Strong grasp of chaotic banter and sarcasm. |
+
+---
+
+## 🤝 Origin & Credits
+
+This project originated from the prototype concept created by [jBahrVR](https://github.com/jBahrVR/jBahrs-Clip-Generator/). 
+
+The current codebase has been entirely re-engineered from the ground up into a production-grade desktop application featuring modular architecture, multi-provider API integrations, native CUDA hardware acceleration, dynamic model discovery, multi-track audio downmixing, comprehensive unit testing, and automated system tray workflows.

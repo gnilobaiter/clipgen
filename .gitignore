@@ -1,0 +1,55 @@
+# Python stuff
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+test_anthropic.py
+.ruff_cache/
+
+# Build folders
+build/
+dist/
+Output/
+logs/
+*.spec
+
+# External Executables & Tools
+bin/
+*.exe
+
+# Personal / Local Data
+config.json
+cookies.txt
+*.mp4
+*.mp3
+*.txt
+!requirements.txt
+!requirements-dev.txt
+*.ini   
+*.iss
+*.zip
+*.log
+results/
+
+# Configuration and API Keys (CRITICAL)
+config.json
+
+# Logs & Caches
+app_crash_log.txt
+logs/auto_scheduler.log
+config/gemini.md
+dummy_clips/
+.pytest_cache/
+.coverage
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

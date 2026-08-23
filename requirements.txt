@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# Core GUI & Utilities
+customtkinter==6.0.0
+PySide6==6.11.2
+Pillow==12.3.0
+pystray==0.19.5
+numpy==2.5.2
+
+# Audio & Local AI (Whisper with CUDA support)
+torch==2.13.0
+openai-whisper==20250625
+
+# Cloud LLM APIs
+openai==2.54.0
+anthropic==1.0.0
+google-genai==2.12.1
