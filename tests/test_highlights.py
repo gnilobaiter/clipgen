@@ -210,3 +210,40 @@ def test_utterances_respect_the_length_cap_and_pass_events_through():
     speech = [u for u in mixed if not u.get("event")]
     assert len(speech) == 1 and (speech[0]["start"], speech[0]["end"]) == (0.0, 8.0)  # the two speech lines are one stretch
     assert hl.build_utterances([]) == []
+
+
+# --------------------------- hard length cap & selection statistics ---------------------------
+def test_limit_length_keeps_the_punchline_or_the_beginning():
+    ok = _clip(0, 100)
+    assert hl.limit_length(ok) is ok  # untouched when within the cap
+    cap = hl.SAFE_MAX_CLIP_SECONDS
+    long_no_peak = hl.limit_length(_clip(1000, 1254))
+    assert (long_no_peak["start_time"], long_no_peak["end_time"]) == (1000, 1000 + cap)
+    with_peak = hl.limit_length(_clip(1000, 1254, peak_time=1100.0))
+    assert with_peak["end_time"] - with_peak["start_time"] == pytest.approx(cap)
+    assert with_peak["start_time"] <= 1100.0 <= with_peak["end_time"]
+    assert 1000 <= with_peak["start_time"] and with_peak["end_time"] <= 1254
+    late_peak = hl.limit_length(_clip(1000, 1254, peak_time=1250.0))
+    assert late_peak["start_time"] <= 1250.0 <= late_peak["end_time"] and late_peak["end_time"] <= 1254
+    assert hl.limit_length(_clip(0, 500), max_len=100)["end_time"] - 0 == 100
+
+
+def test_dedupe_never_widens_a_moment_beyond_the_absolute_maximum():
+    a = _clip(100, 300, 9)  # 200 s
+    b = _clip(180, 380, 7)  # overlaps a lot, the union would be 280 s
+    kept = hl.dedupe_candidates([a, b])
+    assert len(kept) == 1 and (kept[0]["start_time"], kept[0]["end_time"]) == (100, 300)
+    small = hl.dedupe_candidates([_clip(100, 130, 9), _clip(110, 150, 7)])
+    assert (small[0]["start_time"], small[0]["end_time"]) == (100, 150)
+
+
+def test_select_clips_reports_why_candidates_were_dropped():
+    cands = [_clip(100, 130, 9), _clip(120, 150, 8), _clip(300, 330, 5), _clip(500, 503, 9),
+             _clip(600, 630, 7), _clip(800, 830, 7), _clip(1000, 1030, 7)]
+    stats = {}
+    chosen = hl.select_clips(cands, duration=3600, clips_per_hour=3, min_score=6, stats=stats)
+    assert [c["start_time"] for c in chosen] == [100, 600, 800]
+    assert stats == {"low_score": 1, "too_short": 1, "too_close": 1, "over_limit": 1, "limit": 3}
+    unlimited = {}
+    hl.select_clips(cands, duration=3600, clips_per_hour=0, min_score=6, stats=unlimited)
+    assert unlimited["limit"] == -1 and unlimited["over_limit"] == 0

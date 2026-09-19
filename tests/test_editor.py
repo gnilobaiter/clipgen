@@ -1188,3 +1188,55 @@ def test_process_video_runs_the_review_between_selection_and_snapping(tmp_path, 
     fake_config["settings"]["review_boundaries"] = False
     editor.process_video(str(video))
     assert "review" not in order
+
+
+def test_process_video_never_exports_a_clip_longer_than_the_absolute_maximum(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips")},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 900.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 360.0, "peak_time": 200.0, "virality_score": 6, "reasoning": "a 260 s clip nobody asked for"}])
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses", lambda f, clips, _d, logger: clips)
+    seen = {}
+
+    def fake_extract(f, data, *a, **k):
+        seen["clips"] = data["clips"]
+        return ["x.mp4"]
+
+    monkeypatch.setattr("src.core.editor.extract_clips", fake_extract)
+    logs = []
+    assert editor.process_video(str(video), logger=logs.append) is True
+    clip = seen["clips"][0]
+    assert clip["end_time"] - clip["start_time"] <= 240.0
+    assert clip["start_time"] <= 200.0 <= clip["end_time"]  # the punchline survives
+    assert any("Dropped:" in line or "Selected 1 of 1" in line for line in logs)
+
+
+def test_selection_log_explains_the_numbers(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o",
+                   "settings": {"clips_dir": str(tmp_path / "clips"), "clips_per_hour": 12, "min_clip_score": 6},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 3600.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "a"},
+        {"start_time": 400.0, "end_time": 430.0, "virality_score": 5, "reasoning": "weak"},
+        {"start_time": 120.0, "end_time": 150.0, "virality_score": 7, "reasoning": "overlaps a better clip"}])
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses", lambda f, clips, _d, logger: clips)
+    monkeypatch.setattr("src.core.editor.extract_clips", lambda f, data, *a, **k: ["x.mp4"])
+    logs = []
+    editor.process_video(str(video), logger=logs.append)
+    line = next(line for line in logs if "Selected" in line)
+    assert "Selected 1 of 3 candidate(s) (up to 12 at 12/hour)" in line
+    assert "1 below score 6" in line and "1 overlapping a better clip" in line
+
+
+def test_review_prompt_holds_long_clips_to_a_stricter_standard():
+    assert "longer than 120 seconds must be entertaining throughout" in editor.REVIEW_PROMPT

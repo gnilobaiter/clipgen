@@ -18,6 +18,7 @@ OVERSAMPLE = 2.0  # ask the LLM for ~2x the target, selection trims it down
 
 MIN_CLIP_SECONDS = 5.0
 MAX_CLIP_SECONDS = 240.0
+SAFE_MAX_CLIP_SECONDS = MAX_CLIP_SECONDS - 8.0  # leaves room for the small pause-snapping shifts that come later
 MIN_CLIP_GAP = 8.0  # min unclipped seconds between two selected clips
 
 EXPORT_PAD = 0.5  # minimum gap kept between neighbouring clips after refinement
@@ -102,28 +103,58 @@ def dedupe_candidates(candidates: List[Dict[str, Any]], min_overlap: float = 0.4
         if twin is None:
             kept.append(dict(cand))
             continue
-        twin["start_time"] = min(twin["start_time"], cand["start_time"])
-        twin["end_time"] = max(twin["end_time"], cand["end_time"])
+        union_start = min(twin["start_time"], cand["start_time"])
+        union_end = max(twin["end_time"], cand["end_time"])
+        if union_end - union_start <= SAFE_MAX_CLIP_SECONDS:  # never widen a moment beyond the absolute maximum
+            twin["start_time"], twin["end_time"] = union_start, union_end
     return sorted(kept, key=lambda c: c["start_time"])
 
 
 def select_clips(candidates: List[Dict[str, Any]], duration: float, clips_per_hour: float = DEFAULT_CLIPS_PER_HOUR,
-                 min_score: int = DEFAULT_MIN_SCORE, min_gap: float = MIN_CLIP_GAP) -> List[Dict[str, Any]]:
-    """Keeps the best non-overlapping candidates until the density target is reached."""
+                 min_score: int = DEFAULT_MIN_SCORE, min_gap: float = MIN_CLIP_GAP,
+                 stats: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+    """Keeps the best non-overlapping candidates until the density target is reached.
+    `stats`, when given, is filled with why candidates were dropped (low_score, too_short, too_close, over_limit) and the limit."""
     limit = target_clip_count(duration, clips_per_hour)
-    pool = [c for c in candidates
-            if c.get("virality_score", 0) >= min_score and c["end_time"] - c["start_time"] >= MIN_CLIP_SECONDS]
+    counts = {"low_score": 0, "too_short": 0, "too_close": 0, "over_limit": 0, "limit": limit if limit is not None else -1}
+    pool = []
+    for c in candidates:
+        if c.get("virality_score", 0) < min_score:
+            counts["low_score"] += 1
+        elif c["end_time"] - c["start_time"] < MIN_CLIP_SECONDS:
+            counts["too_short"] += 1
+        else:
+            pool.append(c)
     pool.sort(key=lambda c: (-c["virality_score"], c["end_time"] - c["start_time"], c["start_time"]))
 
     chosen: List[Dict[str, Any]] = []
     for cand in pool:
         if limit is not None and len(chosen) >= limit:
-            break
+            counts["over_limit"] += 1
+            continue
         clash = any(cand["start_time"] < c["end_time"] + min_gap and cand["end_time"] > c["start_time"] - min_gap
                     for c in chosen)
-        if not clash:
+        if clash:
+            counts["too_close"] += 1
+        else:
             chosen.append(cand)
+    if stats is not None:
+        stats.update(counts)
     return sorted(chosen, key=lambda c: c["start_time"])
+
+
+def limit_length(clip: Dict[str, Any], max_len: float = SAFE_MAX_CLIP_SECONDS) -> Dict[str, Any]:
+    """Hard cap for clips that came out too long (a model ignoring the maximum, unions, extensions).
+    Keeps the punchline (peak_time) inside, otherwise keeps the beginning."""
+    start, end = float(clip["start_time"]), float(clip["end_time"])
+    if end - start <= max_len:
+        return clip
+    peak = clip.get("peak_time")
+    if peak is not None and start <= float(peak) <= end:
+        new_start = max(start, min(float(peak) - 0.4 * max_len, end - max_len))
+    else:
+        new_start = start
+    return dict(clip, start_time=round(new_start, 2), end_time=round(new_start + max_len, 2))
 
 
 def requested_candidates(window_len: float, clips_per_hour: float) -> int:

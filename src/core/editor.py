@@ -1033,7 +1033,8 @@ REVIEW_PROMPT = (
     "seen the stream. It is the scene with the payoff, plus the directly preceding scene(s) the payoff needs in order to be understood (the setup, the "
     "question, the running gag), plus the immediate reaction ONLY when it is about the same subject. A scene that starts a new subject (noticing a new device, "
     "panel or task, moving on to the next step) is never part of the clip, even when it follows the payoff directly. Never include filler, or scenes that "
-    "merely coordinate the game. Prefer the smallest range that is complete.\n\n"
+    "merely coordinate the game. Prefer the smallest range that is complete. A clip longer than 120 seconds must be entertaining throughout: if it contains "
+    "slow or purely coordinating stretches, keep only the best continuous stretch.\n\n"
     "Return strictly valid JSON: {{\"scenes\": [{{\"start_time\": <float>, \"end_time\": <float>, \"topic\": \"...\", \"humor\": <int>}}, ...], "
     "\"clip_first\": <int>, \"clip_last\": <int>, \"reason\": \"<one short sentence>\"}}\n\n{excerpt}"
 )
@@ -1163,19 +1164,20 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     settings_cfg = config.get("settings", {})
     clips_per_hour = float(settings_cfg.get("clips_per_hour", highlights.DEFAULT_CLIPS_PER_HOUR))
     duration = max((seg["end"] for seg in segments), default=0.0)
-    all_clips = highlights.select_clips(
-        candidates, duration,
-        clips_per_hour=clips_per_hour,
-        min_score=int(settings_cfg.get("min_clip_score", highlights.DEFAULT_MIN_SCORE)),
-    )
+    min_score = int(settings_cfg.get("min_clip_score", highlights.DEFAULT_MIN_SCORE))
+    stats: Dict[str, int] = {}
+    all_clips = highlights.select_clips(candidates, duration, clips_per_hour=clips_per_hour, min_score=min_score, stats=stats)
     if logger and candidates:
-        logger(f"🎚️ Selected {len(all_clips)} of {len(candidates)} candidate(s) (density target: {clips_per_hour:g}/hour).")
+        dropped = [f"{stats[key]} {label}" for key, label in (("low_score", f"below score {min_score}"), ("too_short", "too short"),
+                                                              ("too_close", "overlapping a better clip"), ("over_limit", "over the density limit")) if stats.get(key)]
+        limit_note = f"up to {stats['limit']} at {clips_per_hour:g}/hour" if stats.get("limit", -1) >= 0 else "no limit"
+        logger(f"🎚️ Selected {len(all_clips)} of {len(candidates)} candidate(s) ({limit_note}). Dropped: {', '.join(dropped) or 'none'}.")
     raw_lengths = [c["end_time"] - c["start_time"] for c in all_clips]
     entries = highlights.build_utterances(segments)
     if all_clips and settings_cfg.get("review_boundaries", True):
         all_clips = _review_clip_boundaries(_LLMRoute(config, chat_model), all_clips, entries, duration, logger, is_cancelled, [True])
         if is_cancelled and is_cancelled(): return False
-    all_clips = [highlights.refine_clip(clip, entries, duration) for clip in all_clips]
+    all_clips = [highlights.limit_length(highlights.refine_clip(clip, entries, duration)) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
     if is_cancelled and is_cancelled(): return False
     if logger and all_clips:
