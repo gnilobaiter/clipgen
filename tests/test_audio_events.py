@@ -78,6 +78,18 @@ def test_loudness_is_relative_to_local_baseline_not_global_max():
     assert ae.segment_loudness(0, 1, np.zeros(0), np.zeros(0)) == 0
 
 
+def test_calm_speech_after_a_quiet_stretch_is_not_loud():
+    # 40 s of near-silence drags the rolling median down; normal-level speech right after it used to score 100%
+    audio = np.full(SR * 120, 0.002, dtype=np.float32)
+    audio[SR * 40:SR * 120] = 0.05  # ordinary speech level for most of the recording
+    audio[SR * 100:SR * 103] = 0.4  # a real shout
+    _rms, level_db, baseline_db = ae.compute_level_profile(audio)
+    calm = ae.segment_loudness(41, 45, level_db, baseline_db)
+    shout = ae.segment_loudness(100, 103, level_db, baseline_db)
+    assert calm < 40
+    assert shout >= 60
+
+
 def test_chunked_rms_matches_direct_computation_across_block_boundaries():
     rng = np.random.default_rng(5)
     audio = (rng.standard_normal(ae.FRAME * (ae.RMS_BLOCK_FRAMES * 2 + 123) + 17) * 0.1).astype(np.float32)

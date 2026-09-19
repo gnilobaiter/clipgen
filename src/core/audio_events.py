@@ -26,6 +26,7 @@ SILENCE_DB = -55.0
 
 BURST_EXCESS_DB = 18.0  # calibrated on a real 90-min gameplay VOD: 12 dB fired ~1x/min, 18 dB ~1 per 4 min
 MERGE_GAP_S = 1.0
+LOUDNESS_ABS_MARGIN_DB = 6.0  # a line at the recording's typical level scores at most 6/20 = 30%
 
 
 def _frame_rms(audio: np.ndarray) -> np.ndarray:
@@ -114,11 +115,24 @@ def detect_audio_events(audio: np.ndarray, loud: bool = True, classify: bool = T
     return events
 
 
+def speech_reference_db(level_db: np.ndarray) -> float:
+    """Typical level of the recording while something is audible (75th percentile of non-silent steps)."""
+    active = level_db[level_db > SILENCE_DB]
+    return float(np.percentile(active, 75)) if len(active) else 0.0
+
+
 def segment_loudness(start: float, end: float, level_db: np.ndarray, baseline_db: np.ndarray) -> int:
-    """0-100 loudness of [start, end] relative to the *local* baseline (0 = at baseline, 100 = +20 dB)."""
+    """0-100 loudness of [start, end] (0 = at baseline, 100 = +20 dB).
+
+    The local baseline alone is not enough: after a quiet stretch (pauses, muted game) the rolling median sinks
+    and ordinary calm speech looks like +15 dB. So the rise over the baseline is capped by how far the line is
+    above the typical level of the WHOLE recording (+LOUDNESS_ABS_MARGIN_DB of slack): only really loud lines
+    can score high."""
     if len(level_db) == 0:
         return 0
     lo = max(0, min(int(start / STEP_S), len(level_db) - 1))
     hi = max(lo + 1, min(int(np.ceil(end / STEP_S)), len(level_db)))
     excess = float((level_db[lo:hi] - baseline_db[lo:hi]).max())
+    above_typical = float(level_db[lo:hi].max()) - speech_reference_db(level_db)
+    excess = min(excess, above_typical + LOUDNESS_ABS_MARGIN_DB)
     return int(max(0.0, min(100.0, excess / 20.0 * 100.0)))

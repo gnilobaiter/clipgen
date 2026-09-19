@@ -105,12 +105,12 @@ def test_extract_audio_hidden_failure(monkeypatch):
 def test_enhance_segments_with_audio_analysis():
     segments = [
         {"start": 0.0, "end": 4.0, "text": "calm dialogue"},
-        {"start": 4.0, "end": 6.0, "text": "screaming explosion"}
+        {"start": 56.0, "end": 58.0, "text": "screaming explosion"}
     ]
-    # 6 seconds of 16kHz audio: quiet background, then a loud burst with a sharp spike
-    audio = np.full(96000, 0.02, dtype=np.float32)
-    audio[64000:96000] = 0.8
-    audio[70000:70200] = 1.0
+    # 60 seconds of 16kHz audio: quiet background, then a short loud burst with a sharp spike
+    audio = np.full(960000, 0.02, dtype=np.float32)
+    audio[896000:928000] = 0.8
+    audio[902000:902200] = 1.0
 
     enhanced = editor.analyze_audio_peaks(
         audio, segments, sample_rate=16000, peak_detection=True, combat_detection=True
