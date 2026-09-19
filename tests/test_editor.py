@@ -1098,7 +1098,7 @@ def test_review_extends_a_clip_that_lacked_its_setup_and_shows_marked_context(mo
     result = REAL_REVIEW(route, [clip], _entries(), 300.0, logs.append, None, [True])
     assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 160.0)
     assert clip["start_time"] == 115.0  # input untouched
-    assert any("Clip 1/1: 115-160s -> 100-160s" in line and "needs the question" in line for line in logs)
+    assert any("Clip 1: 115-160s -> 100-160s" in line and "needs the question" in line for line in logs)
     assert any("1 of 1 clip(s) adjusted" in line for line in logs)
     prompt = prompts[0]
     assert "from 115.0s to 160.0s" in prompt and "STEP 1" in prompt and "STEP 2" in prompt
@@ -1455,7 +1455,7 @@ def test_cancel_returns_immediately_even_though_requests_are_still_in_flight():
     assert state["cancel"] is False
 
 
-def test_windows_log_start_duration_and_the_still_waiting_message(monkeypatch):
+def test_windows_log_results_as_they_arrive_and_stay_quiet_otherwise(monkeypatch):
     import time
 
     monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.1)
@@ -1475,14 +1475,30 @@ def test_windows_log_start_duration_and_the_still_waiting_message(monkeypatch):
     config = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek", "settings": {"deepseek_thinking": True}}
     logs = []
     editor._generate_clips_with_llm(_long_segments(40), config, "deepseek-v4-flash", "P", logs.append)
-    starts = [line for line in logs if line.startswith("📨 Window")]
-    assert len(starts) == 4 and all("DeepSeek (reasoning)" in line for line in starts)
-    assert any("Still waiting for DeepSeek (reasoning): 0/4 windows answered" in line and "not frozen" in line for line in logs)
-    assert any(line.startswith("🎯 Window 1/4") and "s)." in line for line in logs)  # each answer shows how long it took
-    assert any("📨 Re-ranking: asking DeepSeek (reasoning)" in line for line in logs)
+    assert not any(line.startswith("📨") for line in logs)  # no per-request announcements
+    assert any("DeepSeek is still thinking... 0/4 windows answered" in line for line in logs)
+    results = [line for line in logs if line.startswith("🎯 Window")]
+    assert len(results) == 4 and all("candidate(s) (" in line and line.endswith("s)") for line in results)
+    assert len(logs) <= 16  # the whole AI stage stays a handful of lines
 
 
-def test_review_logs_every_clip_and_cancel_stops_waiting(monkeypatch):
+def test_heartbeat_waits_for_real_silence_answers_count_as_progress(monkeypatch):
+    import time
+
+    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.3)
+    beats = []
+    durations = {1: 0.1, 2: 0.2, 3: 0.3, 4: 1.0}  # answers keep arriving until 0.3 s, then 0.7 s of silence
+
+    def worker(x):
+        time.sleep(durations[x])
+        return x
+
+    list(editor._run_batches([1, 2, 3, 4], worker, 4, None, lambda seconds, done, total: beats.append((round(seconds, 2), done))))
+    assert beats, "the long silence at the end must be reported"
+    assert beats[0][0] >= 0.55 and beats[0][1] == 3  # only after the last answer + a full quiet period, with 3 already done
+
+
+def test_review_logs_only_changes_and_cancel_stops_waiting(monkeypatch):
     import time
 
     def fake_create(**kwargs):
@@ -1500,9 +1516,10 @@ def test_review_logs_every_clip_and_cancel_stops_waiting(monkeypatch):
              {"start_time": 150.0, "end_time": 190.0, "virality_score": 7, "reasoning": "r"}]
     logs = []
     REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, None, [True])
-    assert sum(line.startswith("📨 Clip") for line in logs) == 2
-    assert any("Clip 1/2: 50-90s -> 20-90s" in line and "needs the setup" in line for line in logs)
-    assert any("Clip 2/2: boundaries kept" in line for line in logs)
+    assert not any(line.startswith("📨") for line in logs)
+    assert any("Clip 1: 50-90s -> 20-90s" in line and "needs the setup" in line for line in logs)
+    assert not any("kept" in line and "Clip 2" in line for line in logs)  # clips that stay as they are are not announced one by one
+    assert any("1 of 2 clip(s) adjusted" in line for line in logs)
 
     slow_started = time.monotonic()
 
