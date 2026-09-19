@@ -59,6 +59,11 @@ class WhisperProgressStream(io.StringIO):
             self.counter += 1
         return super().write(s)
 
+# Peak/mean RMS ratio of a segment that counts as a gunshot/explosion transient. Calibrated on a real 90-min VOD:
+# 3.5 flagged 61% of all lines (plain speech plosives), 8.0 flags the sharpest ~7%.
+COMBAT_TRANSIENT_RATIO = 8.0
+
+
 def analyze_audio_peaks(audio_array: np.ndarray, segments: List[Dict[str, Any]], sample_rate: int = 16000, peak_detection: bool = True, combat_detection: bool = True) -> List[Dict[str, Any]]:
     """Annotates each Whisper segment with `loudness` (0-100, relative to the LOCAL background level,
     not the global maximum) and `is_combat` (sharp percussive transients)."""
@@ -83,8 +88,7 @@ def analyze_audio_peaks(audio_array: np.ndarray, segments: List[Dict[str, Any]],
                 sub_rms = np.array([np.sqrt(np.mean(sc ** 2)) for sc in sub_chunks])
                 mean_sub = np.mean(sub_rms)
                 max_sub = np.max(sub_rms)
-                # A sharp spike (gunshot/hit) typically exceeds 3.5x the local segment average
-                if mean_sub > 0.01 and (max_sub / (mean_sub + 1e-5)) > 3.5:
+                if mean_sub > 0.01 and (max_sub / (mean_sub + 1e-5)) > COMBAT_TRANSIENT_RATIO:
                     is_combat = True
         seg_copy['is_combat'] = is_combat
         enhanced_segments.append(seg_copy)
@@ -492,8 +496,8 @@ def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
         return _clean_and_merge_clips(data)
     return None
 
-# Bump when the cached segment layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds)
-TRANSCRIPT_CACHE_VERSION = 3
+# Bump when the cached segment layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds; v4: YAMNet laughter/scream classifier replaces the modulation heuristic; v5: calibrated combat threshold)
+TRANSCRIPT_CACHE_VERSION = 5
 
 
 def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool, legacy: bool = False) -> str:
@@ -585,7 +589,7 @@ def _annotate_with_audio(audio_array: np.ndarray, raw_segments: List[Dict[str, A
 def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
     """Laughter / scream / loud-burst detection as timeline entries; never fails the whole transcription."""
     try:
-        detected = audio_events.detect_audio_events(audio_array)
+        detected = audio_events.detect_audio_events(audio_array, logger=logger)
     except Exception as e:
         if logger: logger(f"⚠️ Audio event detection skipped: {e}")
         return []
@@ -734,7 +738,7 @@ WINDOW_PROMPT = (
     "{overlap_note}"
     "Line format: [start - end] optional audio tags, then speech. [LOUDNESS: X%] = how far the line rises above the local background level "
     "(shown only when notable); [ACTION: COMBAT] = sharp gunshot/explosion transients; standalone lines such as [LAUGHTER 80%], [SCREAM 90%] or [LOUD 60%] "
-    "were detected in the raw audio (heuristic). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
+    "were detected in the raw audio (LAUGHTER/SCREAM by a pretrained sound classifier, the percentage is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
     "Nominate up to {want} candidate highlights from this section (fewer if it is mostly boring - never pad with weak moments). "
     "Rate each one on an ABSOLUTE 1-10 scale relative to the whole stream and only return candidates scoring 5 or higher. "
     "Return strictly valid JSON with a 'clips' array.\n\n"

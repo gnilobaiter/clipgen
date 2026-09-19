@@ -1,6 +1,6 @@
 # 🎬 Clip Generator
 
-[![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python Version](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch CUDA](https://img.shields.io/badge/CUDA-12.6%20Accelerated-76B900?logo=nvidia&logoColor=white)](https://pytorch.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/Code%20Style-Ruff-black?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
 [![GUI: CustomTkinter](https://img.shields.io/badge/GUI-CustomTkinter-blue)](https://github.com/TomSchimansky/CustomTkinter)
@@ -17,7 +17,10 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 * **100% Free Local GPU Transcription:** Runs OpenAI's Whisper model directly on your NVIDIA GPU (`cuda` / `fp16`) or CPU fallback. Zero transcription API costs.
 * **Deterministic Disk Caching:** Transcriptions are automatically hashed and cached on disk (`%APPDATA%/jBahrsClipGenerator/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing.
 * **Local-Baseline Loudness:** Every transcript line gets `[LOUDNESS: X%]` measured against the *surrounding* background level (rolling ±30 s median), not the global maximum, so one huge scream no longer flattens the rest of the stream.
-* **Laughter / Scream Detection (no extra dependencies):** A numpy-only detector reads the raw waveform and inserts standalone `[LAUGHTER 80%]`, `[SCREAM 90%]` and `[LOUD 60%]` lines into the transcript. Laughter is found by sustained, regular 3-8 Hz amplitude pulsing that is well above the baseline; screams / loud bursts by short peaks 18+ dB over it. Thresholds are deliberately strict (calibrated on a real 90-minute VOD so that only a few dozen events are emitted, not hundreds). These are heuristics, not a trained classifier - the LLM treats them as hints and weighs them against the text.
+* **Laughter / Scream Detection (YAMNet on GPU):** Whisper does not transcribe laughter, so the audio is also run through Google's pretrained **YAMNet** AudioSet classifier (16 MB ONNX model, `onnxruntime-gpu`). Confident laughter / screaming / shouting frames become standalone `[LAUGHTER 60%]` / `[SCREAM 45%]` lines in the transcript (the percentage is the classifier's confidence, so 30-50% is already a real signal); short peaks 18+ dB over the local background add `[LOUD 60%]`. A 90-minute VOD is classified in ~2 s on an RTX GPU.
+  * The model is downloaded once to `%APPDATA%/jBahrsClipGenerator/models/yamnet.onnx` from a pinned Hugging Face commit and verified against a SHA256 before use.
+  * Inference runs in a **separate process**: `onnxruntime-gpu` is built for CUDA 13 while PyTorch ships CUDA 12, and both use identically named DLLs (`cudnn64_9.dll`, ...). Loading both into one Windows process can crash it, a child process cannot take the app down. If the GPU worker fails, the classifier retries on CPU (~12 s per 90 min); if it is unavailable altogether (e.g. offline on the first run) clipping continues without laughter/scream tags.
+  * `onnxruntime-gpu[cuda,cudnn]` pulls its own CUDA 13 libraries (~1 GB of disk) and needs an NVIDIA driver with CUDA 13 support (580+).
 * **Combat & Transient Action Detection:** Sharp percussive transients (gunshots, explosions, hits) are tagged `[ACTION: COMBAT]`.
 * **Word-Level Timestamps:** Whisper runs with `word_timestamps`, which is what makes precise clip boundaries possible.
 * **Multi-Track OBS Downmixing:** Automatically inspects multi-track containers via `ffprobe` and downmixes all channels (Mic, Discord, Game) via FFmpeg `amix` to ensure no speech is lost.
@@ -61,7 +64,7 @@ flowchart LR
     A[Raw Local Video / Recording] --> B[FFmpeg Audio Ingestion]
     B -->|amix Multi-Track| C[16kHz PCM Buffer]
     C --> D[Local GPU Whisper + word timestamps]
-    C --> E[Local-baseline loudness, combat, laughter & scream events]
+    C --> E[Local-baseline loudness + combat + YAMNet laughter/scream events]
     D & E --> F[Annotated Transcript]
     F --> G1[LLM: candidates per 12-min window]
     G1 --> G2[Dedupe + global re-score]
@@ -78,11 +81,11 @@ flowchart LR
 
 ### Minimum Requirements
 * **Operating System:** Windows 10/11 (64-bit)
-* **Python:** 3.10, 3.11, 3.12, or 3.13
+* **Python:** 3.12 or 3.13 (the pinned `numpy` 2.5 requires 3.12+)
 * **Package Manager:** [`uv`](https://github.com/astral-sh/uv) (strongly recommended) and `make`
 
 ### Hardware Recommendations
-* **GPU:** NVIDIA GeForce RTX / GTX series (with CUDA 12.x support) for local Whisper acceleration (`fp16`) and NVENC video exports.
+* **GPU:** NVIDIA GeForce RTX / GTX series (driver with CUDA 13 support, 580+) for local Whisper acceleration (`fp16`), YAMNet sound classification and NVENC video exports.
 * **RAM:** 16 GB+
 * **Disk Space:** High-speed SSD storage for video scratch buffers and caches.
 

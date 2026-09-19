@@ -166,6 +166,20 @@ class MockVar:
         self._value = val
 
 
+@pytest.fixture(autouse=True)
+def isolate_sound_classifier(tmp_path, monkeypatch):
+    """Tests must never download the YAMNet model, touch the real app-data folder or start a GPU worker.
+    Tests that exercise the classifier override these attributes themselves."""
+    from src.core import sound_classifier
+
+    def no_network(_url, **_kwargs):
+        raise OSError("network access is disabled in tests")
+
+    monkeypatch.setattr(sound_classifier, "get_app_data_path", lambda: str(tmp_path / "sound_appdata"))
+    monkeypatch.setattr(sound_classifier.urllib.request, "urlopen", no_network)
+    monkeypatch.setattr(sound_classifier, "_cpu_session", None)
+
+
 @pytest.fixture(scope="session")
 def sample_config():
     """Returns a clean copy of default configuration."""

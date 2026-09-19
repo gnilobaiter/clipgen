@@ -73,7 +73,7 @@ def get_default_config() -> Dict[str, Any]:
                     'Each line: [start - end] then optional tags, then speech. All times are absolute seconds in the source video.\n'
                     '- [LOUDNESS: X%] - the line rises X% of the way (0-100) above the local background level. Shown only when notable: screaming, laughing, shouting.\n'
                     '- [ACTION: COMBAT] - sharp gunshot / explosion / impact transients.\n'
-                    '- Standalone lines like [LAUGHTER 80%], [SCREAM 90%], [LOUD 60%] are detected in the raw audio (heuristic, may be wrong). A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these tags when the text looks flat.\n'
+                    '- Standalone lines like [LAUGHTER 60%], [SCREAM 45%], [LOUD 60%] are detected in the raw audio: LAUGHTER / SCREAM by a pretrained sound classifier (the percentage is its confidence, so 30-50% is already a real signal), LOUD by a loudness detector. They can be wrong. A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these tags when the text looks flat.\n'
                     '\n'
                     '### WHAT IS A HIGHLIGHT\n'
                     '1. COMEDY & BANTER (typically 15-45 s): a clear premise -> payoff, clever roasts, absurd logic, dumb decisions with instant karma, panic screaming, dark humour, laughing fits, friends breaking each other.\n'

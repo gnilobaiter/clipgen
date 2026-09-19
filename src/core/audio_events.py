@@ -1,16 +1,18 @@
-"""Local, dependency-free (numpy only) audio event detection.
+"""Audio events for the transcript timeline.
 
-Whisper transcripts carry no information about laughter or screaming, so this module
-looks at the raw waveform instead. Everything is measured *relative to the local
-background level* (rolling median), never against the global maximum: one huge scream
-must not turn the rest of the stream into "quiet".
+Whisper transcripts carry no information about laughter or screaming, so the raw waveform is analysed:
 
-Detected events are heuristics, not a trained classifier:
-  * LOUD    - short burst well above the surrounding level (SCREAM when it is also high-pitched)
-  * LAUGHTER - sustained, rhythmic (3-8 Hz) amplitude modulation that is louder than the baseline
+  * LOUD              - short burst far above the surrounding background level (numpy, this module)
+  * LAUGHTER / SCREAM - pretrained sound-event classifier (see sound_classifier.py)
+
+Levels are always measured *relative to the local background* (rolling median), never against the global
+maximum: one huge scream must not turn the rest of the stream into "quiet".
+
+(An earlier amplitude-modulation heuristic for laughter was removed: on real speech it fired ~4x per
+minute on things that were not laughter.)
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,15 +22,9 @@ RMS_BLOCK_FRAMES = 6000  # 1 minute of frames per block
 FRAMES_PER_STEP = 50  # analysis grid step = 0.5 s
 STEP_S = FRAMES_PER_STEP / 100.0
 BASELINE_RADIUS_STEPS = 60  # +-30 s rolling median
-LAUGH_WINDOW_FRAMES = 200  # 2 s modulation window
 SILENCE_DB = -55.0
 
 BURST_EXCESS_DB = 18.0  # calibrated on a real 90-min gameplay VOD: 12 dB fired ~1x/min, 18 dB ~1 per 4 min
-SCREAM_CENTROID_HZ = 1500.0
-LAUGH_EXCESS_DB = 6.0
-LAUGH_BAND_HZ = (3.0, 8.0)
-LAUGH_MIN_PEAKINESS = 9.0  # ordinary speech already sits at a median of ~3.5, top 10% at ~7
-LAUGH_MIN_DEPTH = 0.6
 MERGE_GAP_S = 1.0
 
 
@@ -68,17 +64,8 @@ def compute_level_profile(audio: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np
     return rms, level_db, baseline_db
 
 
-def _spectral_centroid(audio: np.ndarray) -> float:
-    if len(audio) < 256:
-        return 0.0
-    spectrum = np.abs(np.fft.rfft(audio.astype(np.float64) * np.hanning(len(audio)))) ** 2  # power-weighted
-    freqs = np.fft.rfftfreq(len(audio), 1.0 / SAMPLE_RATE)
-    total = spectrum.sum()
-    return float((freqs * spectrum).sum() / total) if total > 0 else 0.0
-
-
-def _runs(mask: np.ndarray, max_gap_steps: int) -> List[Tuple[int, int]]:
-    """Groups True indices into (first, last) runs, bridging gaps up to max_gap_steps."""
+def group_runs(mask: np.ndarray, max_gap: int) -> List[Tuple[int, int]]:
+    """Groups True indices into (first, last) runs, bridging gaps of up to `max_gap` False entries."""
     idx = np.flatnonzero(mask)
     if len(idx) == 0:
         return []
@@ -86,7 +73,7 @@ def _runs(mask: np.ndarray, max_gap_steps: int) -> List[Tuple[int, int]]:
     first = prev = int(idx[0])
     for i in idx[1:]:
         i = int(i)
-        if i - prev > max_gap_steps + 1:
+        if i - prev > max_gap + 1:
             runs.append((first, prev))
             first = i
         prev = i
@@ -94,89 +81,35 @@ def _runs(mask: np.ndarray, max_gap_steps: int) -> List[Tuple[int, int]]:
     return runs
 
 
-def detect_loud_events(audio: np.ndarray, level_db: np.ndarray, baseline_db: np.ndarray) -> List[Dict[str, Any]]:
-    """Short bursts far above the local level: screams, jump scares, explosions."""
+def detect_loud_events(level_db: np.ndarray, baseline_db: np.ndarray) -> List[Dict[str, Any]]:
+    """Short bursts far above the local level: jump scares, explosions, sudden shouts."""
     if len(level_db) == 0:
         return []
     excess = level_db - baseline_db
     mask = (excess >= BURST_EXCESS_DB) & (level_db > SILENCE_DB)
     events = []
-    for first, last in _runs(mask, max_gap_steps=int(MERGE_GAP_S / STEP_S)):
-        start_s = first * STEP_S
-        end_s = (last + 1) * STEP_S
+    for first, last in group_runs(mask, max_gap=int(MERGE_GAP_S / STEP_S)):
         peak = float(excess[first:last + 1].max())
-        clip = audio[int(start_s * SAMPLE_RATE):int(min(end_s, start_s + 3.0) * SAMPLE_RATE)]
-        kind = "SCREAM" if _spectral_centroid(clip) >= SCREAM_CENTROID_HZ else "LOUD"
         events.append({
-            "type": kind,
-            "start": round(start_s, 2),
-            "end": round(end_s, 2),
+            "type": "LOUD",
+            "start": round(first * STEP_S, 2),
+            "end": round((last + 1) * STEP_S, 2),
             "strength": int(min(100, round(peak / 30.0 * 100))),
         })
     return events
 
 
-def detect_laughter_events(rms: np.ndarray, level_db: np.ndarray, baseline_db: np.ndarray) -> List[Dict[str, Any]]:
-    """Laughter = sustained, regular 3-8 Hz amplitude pulsing ("ha-ha-ha") that is louder than the baseline.
-
-    Plain speech also pulses at 4-6 Hz, but it is irregular (broad modulation spectrum) and does not sit
-    above the rolling median; requiring a *peaky* modulation spectrum plus a level excess filters most of it.
-    """
-    steps = len(level_db)
-    if steps == 0 or len(rms) < LAUGH_WINDOW_FRAMES:
-        return []
-
-    freqs = np.fft.rfftfreq(LAUGH_WINDOW_FRAMES, d=0.01)
-    band = (freqs >= LAUGH_BAND_HZ[0]) & (freqs <= LAUGH_BAND_HZ[1])
-    broad = (freqs >= 0.5) & (freqs <= 20.0)
-    window = np.hanning(LAUGH_WINDOW_FRAMES)
-
-    hits = np.zeros(steps, dtype=bool)
-    scores = np.zeros(steps)
-    max_start = (len(rms) - LAUGH_WINDOW_FRAMES) // FRAMES_PER_STEP
-    for i in range(min(max_start + 1, steps)):
-        seg = rms[i * FRAMES_PER_STEP:i * FRAMES_PER_STEP + LAUGH_WINDOW_FRAMES]
-        mean = seg.mean()
-        if mean <= 0:
-            continue
-        span = slice(i, min(steps, i + LAUGH_WINDOW_FRAMES // FRAMES_PER_STEP))
-        if level_db[span].mean() <= SILENCE_DB or (level_db[span] - baseline_db[span]).mean() < LAUGH_EXCESS_DB:
-            continue
-        depth = float(seg.std() / mean)
-        if depth < LAUGH_MIN_DEPTH:
-            continue
-        spec = np.abs(np.fft.rfft((seg - mean) * window)) ** 2
-        broad_mean = spec[broad].mean()
-        if broad_mean <= 0:
-            continue
-        peakiness = float(spec[band].max() / broad_mean)
-        if peakiness >= LAUGH_MIN_PEAKINESS:
-            hits[i] = True
-            scores[i] = peakiness
-
-    events = []
-    window_steps = LAUGH_WINDOW_FRAMES // FRAMES_PER_STEP
-    for first, last in _runs(hits, max_gap_steps=int(MERGE_GAP_S / STEP_S)):
-        start_s = first * STEP_S
-        end_s = (last + window_steps) * STEP_S
-        mean_score = float(scores[first:last + 1][hits[first:last + 1]].mean())
-        events.append({
-            "type": "LAUGHTER",
-            "start": round(start_s, 2),
-            "end": round(end_s, 2),
-            "strength": int(min(100, round(mean_score / 15.0 * 100))),
-        })
-    return events
-
-
-def detect_audio_events(audio: np.ndarray, loud: bool = True, laughter: bool = True) -> List[Dict[str, Any]]:
-    """Runs all detectors and returns events sorted by start time."""
-    rms, level_db, baseline_db = compute_level_profile(audio)
+def detect_audio_events(audio: np.ndarray, loud: bool = True, classify: bool = True,
+                        logger: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
+    """Runs all detectors and returns events sorted by start time. The classifier degrades gracefully:
+    if it is unavailable the reason is logged and the loudness events are still returned."""
     events: List[Dict[str, Any]] = []
     if loud:
-        events.extend(detect_loud_events(audio, level_db, baseline_db))
-    if laughter:
-        events.extend(detect_laughter_events(rms, level_db, baseline_db))
+        _rms, level_db, baseline_db = compute_level_profile(audio)
+        events.extend(detect_loud_events(level_db, baseline_db))
+    if classify:
+        from src.core import sound_classifier  # lazy: importing onnxruntime is slow and optional
+        events.extend(sound_classifier.detect_sound_events(audio, logger))
     events.sort(key=lambda e: (e["start"], e["type"]))
     return events
 

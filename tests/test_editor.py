@@ -112,6 +112,15 @@ def test_enhance_segments_with_audio_analysis():
     assert enhanced[1]["loudness"] == 100
 
 
+def test_combat_flag_needs_a_sharp_transient_not_plain_speech_dynamics():
+    rng = np.random.default_rng(2)
+    audio = (rng.standard_normal(16000 * 4) * 0.05).astype(np.float32)  # steady, speech-like level
+    segments = [{"start": 0.0, "end": 2.0, "text": "steady"}, {"start": 2.0, "end": 4.0, "text": "bang"}]
+    audio[16000 * 3:16000 * 3 + 300] = 1.0  # gunshot-like spike
+    enhanced = editor.analyze_audio_peaks(audio, segments, peak_detection=False, combat_detection=True)
+    assert [s["is_combat"] for s in enhanced] == [False, True]
+
+
 def test_analyze_audio_peaks_flags_disabled():
     audio = np.full(16000, 0.1, dtype=np.float32)
     enhanced = editor.analyze_audio_peaks(audio, [{"start": 0.0, "end": 1.0, "text": "x"}], peak_detection=False, combat_detection=False)
@@ -674,7 +683,7 @@ def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
     }]}
     monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *a, **k: mock_model)
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000 * 10, dtype=np.float32))
-    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio: [
+    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio, **kw: [
         {"type": "LAUGHTER", "start": 1.0, "end": 4.0, "strength": 80}])
 
     video = tmp_path / "video.mp4"
@@ -690,7 +699,7 @@ def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
 
 
 def test_event_detection_failure_is_not_fatal(monkeypatch):
-    def boom(audio):
+    def boom(audio, **kw):
         raise ValueError("bad audio")
 
     monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", boom)
@@ -770,7 +779,7 @@ def test_legacy_cache_is_upgraded_without_running_whisper(tmp_path, monkeypatch)
     load_model = MagicMock()
     monkeypatch.setattr("src.core.editor.whisper.load_model", load_model)
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.full(16000 * 10, 0.05, dtype=np.float32))
-    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio: [
+    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio, **kw: [
         {"type": "LAUGHTER", "start": 5.0, "end": 8.0, "strength": 60}])
 
     logs = []

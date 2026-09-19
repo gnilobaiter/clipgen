@@ -11,6 +11,10 @@ numpy==2.5.3
 torch==2.14.0
 openai-whisper==20250625
 
+# Sound-event classifier (YAMNet, laughter/screaming). The CUDA 13 build with its own CUDA/cuDNN wheels; it runs in a
+# separate process because torch above ships CUDA 12 with identically named DLLs (see src/core/sound_classifier.py)
+onnxruntime-gpu[cuda,cudnn]==1.30.0
+
 # Cloud LLM APIs
 openai==3.16.2
 anthropic==1.7.0
