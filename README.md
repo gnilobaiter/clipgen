@@ -17,7 +17,7 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 * **100% Free Local GPU Transcription:** Runs OpenAI's Whisper model directly on your NVIDIA GPU (`cuda` / `fp16`) or CPU fallback. Zero transcription API costs.
 * **Deterministic Disk Caching:** Transcriptions are automatically hashed and cached on disk (`%APPDATA%/jBahrsClipGenerator/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing.
 * **Local-Baseline Loudness:** Every transcript line gets `[LOUDNESS: X%]` measured against the *surrounding* background level (rolling ±30 s median), not the global maximum, so one huge scream no longer flattens the rest of the stream.
-* **Laughter / Scream Detection (no extra dependencies):** A numpy-only detector reads the raw waveform and inserts standalone `[LAUGHTER 80%]`, `[SCREAM 90%]` and `[LOUD 60%]` lines into the transcript. Laughter is found by sustained, regular 3-8 Hz amplitude pulsing that is louder than the baseline; screams by short bursts far above the baseline with a high spectral centroid. These are heuristics, not a trained classifier - the LLM treats them as hints and weighs them against the text.
+* **Laughter / Scream Detection (no extra dependencies):** A numpy-only detector reads the raw waveform and inserts standalone `[LAUGHTER 80%]`, `[SCREAM 90%]` and `[LOUD 60%]` lines into the transcript. Laughter is found by sustained, regular 3-8 Hz amplitude pulsing that is well above the baseline; screams / loud bursts by short peaks 18+ dB over it. Thresholds are deliberately strict (calibrated on a real 90-minute VOD so that only a few dozen events are emitted, not hundreds). These are heuristics, not a trained classifier - the LLM treats them as hints and weighs them against the text.
 * **Combat & Transient Action Detection:** Sharp percussive transients (gunshots, explosions, hits) are tagged `[ACTION: COMBAT]`.
 * **Word-Level Timestamps:** Whisper runs with `word_timestamps`, which is what makes precise clip boundaries possible.
 * **Multi-Track OBS Downmixing:** Automatically inspects multi-track containers via `ffprobe` and downmixes all channels (Mic, Discord, Game) via FFmpeg `amix` to ensure no speech is lost.
@@ -193,7 +193,7 @@ This target executes:
 
 Application settings and cached data are stored in `%APPDATA%/jBahrsClipGenerator/`:
 * `config.json` — Active provider, model preferences, crop dimensions, and storage paths.
-* `transcripts/` — Cached Whisper JSON transcripts (segments, word timestamps, audio events) indexed by video metadata hashes. The cache is versioned: after an upgrade that changes the layout, videos are transcribed once more automatically.
+* `transcripts/` — Cached Whisper JSON transcripts (segments, word timestamps, audio events) indexed by video metadata hashes. The cache is versioned; a transcript cached by an older release is upgraded automatically by reusing the Whisper text and re-analysing only the audio (seconds instead of a new transcription).
 * `settings.clips_per_hour` (default `12`, `0` = unlimited) and `settings.min_clip_score` (default `6`) in `config.json` control how many clips are exported.
 * `logs/` — Timestamped execution and error logs.
 

@@ -24,6 +24,7 @@ PEAK_TAIL = 2.5  # ...and this much reaction after it
 MAX_SNAP_BACK = 6.0
 MAX_SNAP_FORWARD = 6.0
 MAX_LAUGH_EXTEND = 8.0
+LOUDNESS_TAG_MIN = 60  # only ~15% of lines rise 12+ dB above the local level; lower values tag half the transcript
 LONG_SEGMENT = 12.0  # segments longer than this are snapped at word level instead
 
 
@@ -37,7 +38,7 @@ def format_entry(entry: Dict[str, Any]) -> str:
         return f"[{start:.1f}s - {end:.1f}s] [{entry['event']} {entry.get('strength', 0)}%]\n"
     tags = []
     loudness = entry.get("loudness")
-    if loudness is not None and loudness >= 25:
+    if loudness is not None and loudness >= LOUDNESS_TAG_MIN:
         tags.append(f"[LOUDNESS: {int(loudness)}%]")
     if entry.get("is_combat"):
         tags.append("[ACTION: COMBAT]")

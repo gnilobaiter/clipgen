@@ -740,3 +740,70 @@ def test_generation_stops_after_consecutive_window_failures(monkeypatch):
     assert clips == []
     assert mock_client.chat.completions.create.call_count == editor.MAX_CONSECUTIVE_WINDOW_FAILURES * editor.LLM_ATTEMPTS
     assert any("windows failed in a row" in line for line in logs)
+
+
+# ==============================================================================
+# LEGACY (pre-v2) TRANSCRIPT CACHE MIGRATION
+# ==============================================================================
+def test_migrate_legacy_segments_strips_baked_in_tags():
+    legacy = [
+        {"id": 0, "start": 0.0, "end": 2.0, "text": "[LOUDNESS: 42%] [ACTION: COMBAT]  Привет", "tokens": [1, 2], "rms": 0.1},
+        {"start": 2.0, "end": 4.0, "text": " no tags here"},
+        {"start": 4.0, "text": "broken"},
+        "junk",
+    ]
+    migrated = editor._migrate_legacy_segments(legacy)
+    assert [s["text"].strip() for s in migrated] == ["Привет", "no tags here"]
+    assert all(set(s) == {"start", "end", "text"} for s in migrated)
+
+
+def test_legacy_cache_is_upgraded_without_running_whisper(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+
+    legacy_file = editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True)
+    new_file = editor._get_transcription_cache_path(str(video), "base", "ru", True, True)
+    assert legacy_file != new_file
+    editor._save_cached_segments(legacy_file, [{"start": 0.0, "end": 5.0, "text": "[LOUDNESS: 80%] GG WP"}])
+
+    load_model = MagicMock()
+    monkeypatch.setattr("src.core.editor.whisper.load_model", load_model)
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.full(16000 * 10, 0.05, dtype=np.float32))
+    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio: [
+        {"type": "LAUGHTER", "start": 5.0, "end": 8.0, "strength": 60}])
+
+    logs = []
+    config = {"openai": {"whisper_model": "base", "whisper_language": "Russian"}, "settings": {"audio_peak_detection": True, "combat_detection": True}}
+    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+
+    load_model.assert_not_called()
+    assert [bool(e.get("event")) for e in result] == [False, True]
+    assert result[0]["text"].strip() == "GG WP" and "loudness" in result[0]
+    assert os.path.exists(new_file)
+    assert any("older cached transcript" in line for line in logs)
+
+    again = editor._transcribe_audio_to_segments(str(video), config, logs.append, None)  # now served from the v2 cache
+    assert again == result
+
+
+def test_legacy_migration_falls_back_to_whisper_when_audio_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    editor._save_cached_segments(editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True),
+                                 [{"start": 0.0, "end": 5.0, "text": "x"}])
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", MagicMock(side_effect=RuntimeError("ffmpeg died")))
+    logs = []
+    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, logs.append, None) is None
+    assert any("transcribing from scratch" in line for line in logs)
+
+
+def test_legacy_migration_noop_without_legacy_file_and_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, None, None) is None
+    editor._save_cached_segments(editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True),
+                                 [{"start": 0.0, "end": 5.0, "text": "x"}])
+    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, None, lambda: True) == []

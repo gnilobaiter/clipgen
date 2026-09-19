@@ -23,12 +23,12 @@ BASELINE_RADIUS_STEPS = 60  # +-30 s rolling median
 LAUGH_WINDOW_FRAMES = 200  # 2 s modulation window
 SILENCE_DB = -55.0
 
-BURST_EXCESS_DB = 12.0
+BURST_EXCESS_DB = 18.0  # calibrated on a real 90-min gameplay VOD: 12 dB fired ~1x/min, 18 dB ~1 per 4 min
 SCREAM_CENTROID_HZ = 1500.0
-LAUGH_EXCESS_DB = 3.0
+LAUGH_EXCESS_DB = 6.0
 LAUGH_BAND_HZ = (3.0, 8.0)
-LAUGH_MIN_PEAKINESS = 3.0
-LAUGH_MIN_DEPTH = 0.45
+LAUGH_MIN_PEAKINESS = 9.0  # ordinary speech already sits at a median of ~3.5, top 10% at ~7
+LAUGH_MIN_DEPTH = 0.6
 MERGE_GAP_S = 1.0
 
 
@@ -111,7 +111,7 @@ def detect_loud_events(audio: np.ndarray, level_db: np.ndarray, baseline_db: np.
             "type": kind,
             "start": round(start_s, 2),
             "end": round(end_s, 2),
-            "strength": int(min(100, round(peak / 25.0 * 100))),
+            "strength": int(min(100, round(peak / 30.0 * 100))),
         })
     return events
 
@@ -164,7 +164,7 @@ def detect_laughter_events(rms: np.ndarray, level_db: np.ndarray, baseline_db: n
             "type": "LAUGHTER",
             "start": round(start_s, 2),
             "end": round(end_s, 2),
-            "strength": int(min(100, round(mean_score / 10.0 * 100))),
+            "strength": int(min(100, round(mean_score / 15.0 * 100))),
         })
     return events
 

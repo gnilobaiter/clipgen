@@ -492,19 +492,21 @@ def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
         return _clean_and_merge_clips(data)
     return None
 
-# Bump when the cached segment layout changes (v2: word timestamps, local-baseline loudness, audio events)
-TRANSCRIPT_CACHE_VERSION = 2
+# Bump when the cached segment layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds)
+TRANSCRIPT_CACHE_VERSION = 3
 
 
-def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool) -> str:
-    """Computes a deterministic hash and cache file path for audio transcriptions."""
+def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool, legacy: bool = False) -> str:
+    """Computes a deterministic hash and cache file path for audio transcriptions.
+    `legacy=True` gives the path of the pre-v2 cache entry (no version prefix in the key)."""
     try:
         mtime = os.path.getmtime(file_path)
         size = os.path.getsize(file_path)
     except Exception:
         mtime, size = 0, 0
     
-    cache_key = f"v{TRANSCRIPT_CACHE_VERSION}_{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}"
+    version_prefix = "" if legacy else f"v{TRANSCRIPT_CACHE_VERSION}_"
+    cache_key = f"{version_prefix}{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}"
     file_hash = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
     
     cache_dir = os.path.join(get_app_data_path(), "transcripts")
@@ -550,6 +552,36 @@ def _slim_segments(raw_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return slim
 
 
+_LEGACY_TAGS = re.compile(r"^\s*((?:\[LOUDNESS: \d+%\]|\[ACTION: COMBAT\])\s*)+")
+
+
+def _migrate_legacy_segments(legacy: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Turns a pre-v2 cache entry (audio tags baked into `text`, global-max loudness) back into clean Whisper
+    segments so the expensive transcription is not repeated. Loudness/events are recomputed from the audio."""
+    clean = []
+    for seg in legacy:
+        if not isinstance(seg, dict) or "start" not in seg or "end" not in seg:
+            continue
+        text = str(seg.get("text", ""))
+        match = _LEGACY_TAGS.match(text)
+        if match:
+            text = text[match.end():]
+        clean.append({"start": seg["start"], "end": seg["end"], "text": text})
+    return _slim_segments(clean)
+
+
+def _annotate_with_audio(audio_array: np.ndarray, raw_segments: List[Dict[str, Any]], audio_peak_detection: bool,
+                         combat_detection: bool, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
+    """Adds local-baseline loudness / combat flags to segments and merges detected audio events into the timeline."""
+    segments = raw_segments
+    if audio_peak_detection or combat_detection:
+        segments = analyze_audio_peaks(audio_array, raw_segments, peak_detection=audio_peak_detection, combat_detection=combat_detection)
+    if audio_peak_detection and raw_segments:
+        events = _detect_events_safe(audio_array, logger)
+        segments = sorted(segments + events, key=lambda e: (e["start"], 0 if e.get("event") else 1))
+    return segments
+
+
 def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
     """Laughter / scream / loud-burst detection as timeline entries; never fails the whole transcription."""
     try:
@@ -583,6 +615,28 @@ LANGUAGE_MAP = {
     "Turkish": "tr"
 }
 
+def _migrate_legacy_cache(file_path: str, cache_file: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool,
+                          logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]]) -> Optional[List[Dict[str, Any]]]:
+    """Upgrades a pre-v2 transcript cache entry (audio extraction only, no Whisper). None = nothing to migrate / fall back to Whisper; [] = cancelled."""
+    legacy_file = _get_transcription_cache_path(file_path, whisper_model, target_language, audio_peak, combat, legacy=True)
+    legacy = _load_cached_segments(legacy_file, None)
+    if legacy is None:
+        return None
+    raw_segments = _migrate_legacy_segments(legacy)
+    if not raw_segments:
+        return None
+    if logger: logger(f"♻️ Found an older cached transcript ({len(raw_segments)} segments) - reusing the Whisper text, re-analysing the audio only...")
+    if is_cancelled and is_cancelled(): return []
+    try:
+        audio_array = extract_audio_hidden(file_path)
+        segments = _annotate_with_audio(audio_array, raw_segments, audio_peak, combat, logger)
+    except Exception as e:
+        if logger: logger(f"⚠️ Could not upgrade the older cache ({e}); transcribing from scratch.")
+        return None
+    _save_cached_segments(cache_file, segments, logger)
+    return segments
+
+
 def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]]) -> Optional[List[Dict[str, Any]]]:
     whisper_model_type = config.get("openai", {}).get("whisper_model", "medium")
     language_setting = config.get("openai", {}).get("whisper_language", "Auto-Detect")
@@ -601,6 +655,10 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
     cached_segments = _load_cached_segments(cache_file, logger)
     if cached_segments is not None:
         return cached_segments
+
+    migrated = _migrate_legacy_cache(file_path, cache_file, whisper_model_type, target_language, audio_peak_detection, combat_detection, logger, is_cancelled)
+    if migrated is not None:
+        return migrated
 
     # Hardware check & detailed status logging
     log_hardware_info(logger)
@@ -654,12 +712,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
             
         raw_segments = _slim_segments(result.get("segments", []))
 
-        segments = raw_segments
-        if audio_peak_detection or combat_detection:
-            segments = analyze_audio_peaks(audio_array, raw_segments, peak_detection=audio_peak_detection, combat_detection=combat_detection)
-        if audio_peak_detection:
-            events = _detect_events_safe(audio_array, logger)
-            segments = sorted(segments + events, key=lambda e: (e["start"], 0 if e.get("event") else 1))
+        segments = _annotate_with_audio(audio_array, raw_segments, audio_peak_detection, combat_detection, logger)
         if logger:
             logger("✅ Transcription complete! Audio patterns analyzed." if (audio_peak_detection or combat_detection) else "✅ Transcription complete!")
 
