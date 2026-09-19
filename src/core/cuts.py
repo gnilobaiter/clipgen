@@ -73,7 +73,7 @@ def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, r
         if p_end < lo or p_start > hi:
             continue
         distance = 0.0 if p_start <= rel <= p_end else min(abs(rel - p_start), abs(rel - p_end))
-        score = distance - 0.5 * min(p_end - p_start, 1.0)  # nearer wins, a longer pause is preferred
+        score = distance - 1.0 * min(p_end - p_start, 0.8)  # nearer wins, but a real pause beats a tiny gap between words
         if best_score is None or score < best_score:
             best, best_score = (p_start, p_end), score
     if best is None:

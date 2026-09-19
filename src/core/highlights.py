@@ -5,6 +5,7 @@ Pipeline position:  transcript + audio events -> windows -> [LLM candidates] -> 
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 WINDOW_SECONDS = 720.0  # 12 min of transcript per LLM request
@@ -16,6 +17,7 @@ DEFAULT_MIN_SCORE = 6
 OVERSAMPLE = 2.0  # ask the LLM for ~2x the target, selection trims it down
 
 MIN_CLIP_SECONDS = 5.0
+MAX_CLIP_SECONDS = 240.0
 MIN_CLIP_GAP = 8.0  # min unclipped seconds between two selected clips
 
 EXPORT_PAD = 0.5  # minimum gap kept between neighbouring clips after refinement
@@ -214,3 +216,50 @@ def resolve_overlaps(clips: List[Dict[str, Any]], pad: float = EXPORT_PAD) -> Li
         else:
             nxt["start_time"] = round(prev["end_time"] + pad, 2)
     return [c for c in ordered if c["end_time"] - c["start_time"] >= MIN_CLIP_SECONDS]
+
+
+# --------------------------------------------------------------------------------------
+# Utterances: transcript lines that follow real speech pauses instead of Whisper's chunking
+# --------------------------------------------------------------------------------------
+UTTERANCE_GAP = 0.3  # a silence this long between two Whisper segments is a real pause
+UTTERANCE_MAX = 14.0
+_SENTENCE_END = re.compile(r"[.?!…]\s*$")
+
+
+def build_utterances(segments: List[Dict[str, Any]], gap: float = UTTERANCE_GAP, max_len: float = UTTERANCE_MAX) -> List[Dict[str, Any]]:
+    """Joins Whisper segments that are one continuous stretch of speech.
+
+    Whisper splits arbitrarily: a phrase can be cut between two lines ("... от 1 от" / "0 до 9 ..."), which makes any
+    clip boundary chosen from those lines logically ragged. Two neighbouring segments are merged when there is no real
+    pause between them (< `gap` s of silence) AND the first one does not end a sentence with . ? ! ... Word
+    timestamps are useless for this (93% of word gaps are exactly zero), segment gaps and punctuation are not.
+    Audio events pass through unchanged and never merge anything."""
+    out: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    for seg in sorted(segments, key=lambda e: (e["start"], 0 if e.get("event") else 1)):
+        if seg.get("event"):
+            out.append(dict(seg))
+            continue
+        if current is not None:
+            silence = float(seg["start"]) - float(current["end"])
+            joins = (silence < gap and not _SENTENCE_END.search(str(current["text"]))
+                     and float(seg["end"]) - float(current["start"]) <= max_len)
+            if joins:
+                current["end"] = max(float(current["end"]), float(seg["end"]))
+                current["text"] = f"{str(current['text']).strip()} {str(seg['text']).strip()}"
+                if seg.get("loudness") is not None:
+                    current["loudness"] = max(current.get("loudness", 0), seg["loudness"])
+                current["is_combat"] = bool(current.get("is_combat") or seg.get("is_combat"))
+                current["words"] = list(current.get("words") or []) + list(seg.get("words") or [])
+                continue
+            out.append(current)
+        current = dict(seg)
+        current["words"] = list(seg.get("words") or [])
+        current["text"] = str(seg.get("text", "")).strip()
+    if current is not None:
+        out.append(current)
+    for entry in out:
+        if not entry.get("words"):
+            entry.pop("words", None)
+    return sorted(out, key=lambda e: (e["start"], 0 if e.get("event") else 1))

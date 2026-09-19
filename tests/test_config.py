@@ -32,11 +32,13 @@ def test_get_default_config():
     default_prompt = config["prompts"]["profiles"]["Default"]
     assert "COMEDY & BANTER" in default_prompt
     assert "EPIC GAMEPLAY" in default_prompt
-    assert "HOW TO CUT" in default_prompt
     assert "peak_time" in default_prompt
     assert "LANGUAGE" in default_prompt
     assert "virality_score" in default_prompt
-    assert "HOW LONG" in default_prompt and "There is no target length" in default_prompt
+    assert "WHAT MAKES A GOOD CLIP RANGE" in default_prompt and "there is no target" in default_prompt
+    assert "ONE moment, ONE topic" in default_prompt and "HOW TO MARK IT" in default_prompt
+    assert "cut shorter" not in default_prompt  # "when in doubt, cut shorter" produced clips without their setup
+    assert config["settings"]["review_boundaries"] is True
     # the old numeric "typical" ranges and the 90 s cap used to be read by the model as a length to aim for
     for anchor in ("hard maximum", "15-45", "25-65", "Typical duration"):
         assert anchor not in default_prompt

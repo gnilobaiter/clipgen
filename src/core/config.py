@@ -48,7 +48,8 @@ def get_default_config() -> Dict[str, Any]:
             "audio_peak_detection": True,
             "combat_detection": True,
             "clips_per_hour": 12,
-            "min_clip_score": 6
+            "min_clip_score": 6,
+            "review_boundaries": True
         },
         "active_ai_provider": "openai",
         "openai_model": "gpt-5.5",
@@ -80,17 +81,17 @@ def get_default_config() -> Dict[str, Any]:
                     '2. EPIC GAMEPLAY: multi-kills, 1vX clutches, insane shots, desperate escapes, boss climaxes, physics chaos, team wipes. Keep the FULL sequence in one clip - never chop a killstreak in two.\n'
                     'Not highlights: routine chatter, looting, travel, menus, single ordinary kills, jokes with no reaction, people merely talking ABOUT something funny.\n'
                     '\n'
-                    '### HOW LONG (this matters)\n'
-                    '- The length of a clip is decided ONLY by its content. There is no target length and no "typical" length: never aim for one. Cut from the first line the viewer needs in order to understand the moment to the last line of its reaction, and stop.\n'
-                    '- A one-liner with its laugh is usually 8-25 s. A banter exchange or a short fight is usually 20-50 s. Only a stretch that is continuously great from start to finish (a long clutch, an escalating disaster, a real laughing fit that keeps going) runs 1-3 minutes. Absolute maximum 240 s.\n'
-                    '- Never pad a clip with neighbouring chatter, walking or a second unrelated joke. Two separate moments are two clips. If a joke needs minutes of explanation to work, it is not a clip.\n'
-                    '- When in doubt, cut shorter: every second before the setup and after the reaction is a defect.\n'
+                    '### WHAT MAKES A GOOD CLIP RANGE (this matters most)\n'
+                    '- A clip is watched ON ITS OWN by someone who has never seen the stream. It must be understandable and satisfying without anything before or after it.\n'
+                    "- START where the situation becomes understandable: the question that gets answered, the premise, the thing that just happened and is being reacted to. If the payoff needs an earlier line to make sense, include that line, even if it is 10-20 s earlier. Start on a line's [start], never in the middle of a sentence or an exchange.\n"
+                    "- END after the payoff AND its reaction has resolved (the laugh, the exclamation, the answer), on a line's [end]. Never cut a joke, sentence or back-and-forth off, and stop before the conversation moves to another topic.\n"
+                    '- ONE moment, ONE topic per clip. A clip must never contain a topic change. Two moments are two clips, even when they follow each other directly.\n'
+                    '- Length is only the RESULT of these rules: there is no target and no "typical" length, never aim for one. A one-liner with its laugh can be 8-25 s, a banter exchange 20-60 s, a stretch that is continuously great 1-3 minutes. Absolute maximum 240 s. Do not pad: skip lead-in chatter and stop when the moment is over.\n'
                     '\n'
-                    '### HOW TO CUT\n'
-                    "- start_time = the [start] of the first line the viewer needs. Comedy: usually only 2-8 s before the punchline. Gameplay: 2-5 s before the action starts. Use a line's [start] - never a time inside a line.\n"
-                    "- end_time = the [end] of the last line of the reaction. If a [LAUGHTER]/[SCREAM] line follows the payoff, end at that line's [end]. Stop as soon as the reaction fades; dead air and the next topic are not part of the clip.\n"
+                    '### HOW TO MARK IT\n'
+                    "- start_time = the [start] of the first line the viewer needs. end_time = the [end] of the last line of the reaction (if a [LAUGHTER]/[SCREAM] line follows the payoff, that line's [end]).\n"
                     '- peak_time = the second of the punchline / climax itself (the funniest or most intense instant).\n'
-                    '- One continuous moment per clip. Never tile the transcript into back-to-back chunks; unclipped baseline content must separate clips.\n'
+                    '- Never tile the transcript into back-to-back chunks; unclipped baseline content must separate clips.\n'
                     '- If any player says "clip it" / "clip that" (or the equivalent in the transcript\'s language), nominate that moment with virality_score = 10.\n'
                     '\n'
                     '### SCORING (ABSOLUTE scale for the whole stream, not for this section)\n'
@@ -106,9 +107,11 @@ def get_default_config() -> Dict[str, Any]:
                     '[824.5s - 829.0s] [LAUGHTER 60%]\n'
                     "[829.0s - 833.0s] Okay, let's go loot the building.\n"
                     'Correct candidate (17 s): {"start_time": 812.0, "end_time": 829.0, "peak_time": 819.0, "virality_score": 8, "reasoning": "Deadpan excuse (\'I thought it was a wall\') followed by a real laughing fit."}\n'
-                    'Wrong: start 815.5 (loses the setup), end 824.5 (cuts the laugh), end 833.0 (dead air), or a clip that also swallows the minute of chatter before and after it.\n'
+                    'Wrong: start 815.5 (the joke is not understandable without the question), end 824.5 (cuts the laugh), end 833.0 (dead air), or a clip that also swallows the minute of chatter before and after it.\n'
                     '\n'
-                    'A long clip is right only when the whole stretch is continuously funny, e.g. three friends spend two and a half minutes failing to defuse a bomb, with a new scream, insult or laughing fit every 10-15 seconds and no dead spot: one clip of about 150 s, scored by its best instants. The same stretch with a quiet minute in the middle is two short clips, not one long one.\n'
+                    'Second example - context matters: a reply like "Nah, it was the left one!" is only funny if the clip includes the earlier line where the other player insisted on the right one. Start there. But if a heated argument then turns into planning the next objective, that planning is a different topic: end before it.\n'
+                    '\n'
+                    'A long clip is right only when the whole stretch is continuously funny about the same thing, e.g. three friends spend two and a half minutes failing to defuse a bomb, with a new scream, insult or laughing fit every 10-15 seconds and no dead spot: one clip of about 150 s. The same stretch with a quiet minute in the middle is two short clips, not one long one.\n'
                     '\n'
                     '### LANGUAGE\n'
                     "The 'reasoning' field MUST be in the SAME language as the transcript.\n"
@@ -150,6 +153,7 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             settings.setdefault("combat_detection", True)
             settings.setdefault("clips_per_hour", 12)
             settings.setdefault("min_clip_score", 6)
+            settings.setdefault("review_boundaries", True)
             
             openai_cfg = cfg.setdefault("openai", {})
             openai_cfg.setdefault("base_url", "")

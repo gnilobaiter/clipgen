@@ -170,3 +170,43 @@ def test_build_windows_absorbs_tiny_tail():
     windows = hl.build_windows(entries)
     assert windows[-1]["end"] == 1390
     assert all(w["end"] - w["start"] > hl.WINDOW_OVERLAP * 2 for w in windows)
+
+
+# --------------------------- utterances ---------------------------
+def _w(word, start, end):
+    return {"word": word, "start": start, "end": end}
+
+
+def test_utterances_join_continuous_speech_that_whisper_split_mid_phrase():
+    segs = [
+        _seg(10.0, 14.0, " там от 1 от", words=[_w(" там", 10.0, 10.5)], loudness=20),
+        _seg(14.1, 17.0, " 0 до 9 цифры", words=[_w(" 0", 14.1, 14.4)], loudness=70, is_combat=True),
+        _seg(20.0, 22.0, " Новая тема."),
+    ]
+    out = hl.build_utterances(segs)
+    assert [(u["start"], u["end"]) for u in out] == [(10.0, 17.0), (20.0, 22.0)]
+    assert out[0]["text"] == "там от 1 от 0 до 9 цифры"
+    assert out[0]["loudness"] == 70 and out[0]["is_combat"] is True
+    assert [w["word"] for w in out[0]["words"]] == [" там", " 0"]
+    assert segs[0]["end"] == 14.0  # input untouched
+
+
+def test_utterances_do_not_join_across_a_real_pause_or_a_finished_sentence():
+    real_pause = [_seg(0.0, 3.0, "первая фраза"), _seg(3.6, 6.0, "вторая фраза")]  # 0.6 s of silence
+    assert len(hl.build_utterances(real_pause)) == 2
+    sentence_end = [_seg(0.0, 3.0, "Первая фраза."), _seg(3.05, 6.0, "Вторая фраза")]  # tiny gap but the sentence ended
+    assert len(hl.build_utterances(sentence_end)) == 2
+    question = [_seg(0.0, 3.0, "Что?"), _seg(3.0, 4.0, "Да")]
+    assert len(hl.build_utterances(question)) == 2
+
+
+def test_utterances_respect_the_length_cap_and_pass_events_through():
+    run_on = [_seg(i * 4.0, i * 4.0 + 4.0, f"часть {i}") for i in range(6)]  # 24 s of gapless speech
+    out = hl.build_utterances(run_on)
+    assert len(out) >= 2 and all(u["end"] - u["start"] <= hl.UTTERANCE_MAX + 1e-6 for u in out)
+    event = {"start": 5.0, "end": 7.0, "text": "", "event": "LAUGHTER", "strength": 60}
+    mixed = hl.build_utterances([_seg(0.0, 4.0, "а"), event, _seg(4.1, 8.0, "б")])
+    assert sum(1 for u in mixed if u.get("event")) == 1  # the event is kept and never merged into speech
+    speech = [u for u in mixed if not u.get("event")]
+    assert len(speech) == 1 and (speech[0]["start"], speech[0]["end"]) == (0.0, 8.0)  # the two speech lines are one stretch
+    assert hl.build_utterances([]) == []

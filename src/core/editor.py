@@ -431,7 +431,8 @@ def _validate_api_keys(config: Dict[str, Any], chat_model: str, logger: Optional
     return True
 
 def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sanitizes, validates timestamps, and merges accidental micro-overlaps or contiguous fragments."""
+    """Sanitizes, validates timestamps, and merges nominations of the SAME moment (real overlap only).
+    Back-to-back nominations stay separate: gluing them used to put two different topics into one clip."""
     if not clips:
         return []
 
@@ -473,7 +474,7 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         prev = merged[-1]
-        if clip["start_time"] <= prev["end_time"] + 2.0:
+        if clip["start_time"] < prev["end_time"]:
             combined_duration = max(prev["end_time"], clip["end_time"]) - prev["start_time"]
             if combined_duration <= MAX_MERGED_CLIP_SECONDS:
                 prev["end_time"] = max(prev["end_time"], clip["end_time"])
@@ -967,7 +968,8 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
     extra_body_enabled = [True]
     clips_per_hour = float(config.get("settings", {}).get("clips_per_hour", highlights.DEFAULT_CLIPS_PER_HOUR))
 
-    windows = highlights.build_windows(segments)
+    entries = highlights.build_utterances(segments)  # lines that follow real pauses, not Whisper's arbitrary chunking
+    windows = highlights.build_windows(entries)
     if not windows:
         return []
     duration = max(w["end"] for w in windows)
@@ -1009,6 +1011,95 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
         if logger: logger(f"⚖️ Re-ranking {len(candidates)} candidates on a common scale...")
         candidates = _rerank_candidates(route, candidates, segments, duration, logger, extra_body_enabled)
     return candidates
+
+
+REVIEW_CONTEXT = 45.0
+MAX_REVIEW_FAILURES = 2
+
+REVIEW_SYSTEM = (
+    "You are a precise video editor. You split a stream excerpt into scenes and pick the one self-contained clip range in it. "
+    "Answer with strictly valid JSON exactly in the requested format and nothing else."
+)
+
+REVIEW_PROMPT = (
+    "Below is a transcript excerpt of a gaming stream ({lo:.0f}s - {hi:.0f}s). A highlight clip was proposed from {start:.1f}s to {end:.1f}s "
+    "(lines inside it are marked with '>'). All times are absolute seconds. Line format: [start - end] tags and speech; standalone "
+    "[LAUGHTER n%] / [SCREAM n%] / [LOUD n%] lines come from an audio classifier.\n\n"
+    "STEP 1 - split the WHOLE excerpt into consecutive scenes. A new scene starts whenever the subject of the conversation changes "
+    "(a different joke, a different puzzle or game object, a different question, moving from banter to giving instructions, and so on). "
+    "For every scene give start_time and end_time (only values printed on the lines), a short topic, and 'humor' 0-10 = how funny or entertaining it is "
+    "for someone who has never seen the stream (10 = laugh out loud, 3 = people merely explaining or coordinating).\n"
+    "STEP 2 - choose the clip: a range of CONSECUTIVE scenes (clip_first .. clip_last) that forms ONE self-contained moment for someone who has never "
+    "seen the stream. It is the scene with the payoff, plus the directly preceding scene(s) the payoff needs in order to be understood (the setup, the "
+    "question, the running gag), plus the immediate reaction ONLY when it is about the same subject. A scene that starts a new subject (noticing a new device, "
+    "panel or task, moving on to the next step) is never part of the clip, even when it follows the payoff directly. Never include filler, or scenes that "
+    "merely coordinate the game. Prefer the smallest range that is complete.\n\n"
+    "Return strictly valid JSON: {{\"scenes\": [{{\"start_time\": <float>, \"end_time\": <float>, \"topic\": \"...\", \"humor\": <int>}}, ...], "
+    "\"clip_first\": <int>, \"clip_last\": <int>, \"reason\": \"<one short sentence>\"}}\n\n{excerpt}"
+)
+
+
+def _parse_review(raw_text: Any) -> Optional[Dict[str, Any]]:
+    """Turns the scene split + chosen scene range into {start_time, end_time, reason, scenes}."""
+    data = _load_json_payload(raw_text)
+    if not isinstance(data, dict) or not isinstance(data.get("scenes"), list):
+        return None
+    try:
+        scenes = [{"start_time": float(sc["start_time"]), "end_time": float(sc["end_time"]), "topic": str(sc.get("topic", ""))} for sc in data["scenes"]]
+        first, last = int(data["clip_first"]), int(data["clip_last"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not scenes or not 0 <= first <= last < len(scenes):
+        return None
+    return {"start_time": scenes[first]["start_time"], "end_time": scenes[last]["end_time"],
+            "reason": str(data.get("reason", "")).strip(), "scenes": len(scenes)}
+
+
+def _accept_review(clip: Dict[str, Any], review: Dict[str, Any], duration: float) -> bool:
+    """A reviewed range is only trusted if it is sane and clearly the same moment (the model may legitimately drop
+    a scene about another topic, so it may not lose the whole original range)."""
+    start, end = review["start_time"], review["end_time"]
+    if start < 0 or end > duration + 1.0 or not highlights.MIN_CLIP_SECONDS <= end - start <= highlights.MAX_CLIP_SECONDS:
+        return False
+    if abs(start - clip["start_time"]) > REVIEW_CONTEXT or abs(end - clip["end_time"]) > REVIEW_CONTEXT:
+        return False
+    overlap = min(end, clip["end_time"]) - max(start, clip["start_time"])
+    return overlap >= 0.3 * min(end - start, clip["end_time"] - clip["start_time"])
+
+
+def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entries: List[Dict[str, Any]], duration: float,
+                            logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]],
+                            extra_body_enabled: List[bool]) -> List[Dict[str, Any]]:
+    """Pass 3: every selected clip is looked at on its own with 45 s of surrounding transcript. The model first splits the
+    excerpt into scenes (a new one whenever the subject changes) and then picks the range of scenes that forms one
+    self-contained moment. Splitting first matters: asked to merely "judge" a clip, a fast model called a clip that
+    glued two topics together "one continuous exchange". This fixes clips that lack their setup, run into the next
+    topic or drag on; pass 1 looks at 12 minutes at once and is much less precise about where a moment really is."""
+    reviewed: List[Dict[str, Any]] = []
+    failures = changed = 0
+    for i, clip in enumerate(clips, start=1):
+        if is_cancelled and is_cancelled():
+            return clips
+        if failures >= MAX_REVIEW_FAILURES:
+            reviewed.append(clip)
+            continue
+        lo, hi = clip["start_time"] - REVIEW_CONTEXT, clip["end_time"] + REVIEW_CONTEXT
+        excerpt = "".join(("> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ") + highlights.format_entry(e)
+                          for e in entries if e["end"] > lo and e["start"] < hi)
+        prompt = REVIEW_PROMPT.format(lo=lo, hi=hi, start=clip["start_time"], end=clip["end_time"], excerpt=excerpt)
+        review = _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
+        if review is None:
+            failures += 1
+            reviewed.append(clip)
+            continue
+        failures = 0
+        if _accept_review(clip, review, duration) and (abs(review["start_time"] - clip["start_time"]) > 0.5 or abs(review["end_time"] - clip["end_time"]) > 0.5):
+            changed += 1
+            if logger: logger(f"🔍 Clip {i}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s ({review['reason'][:110]})")
+            clip = dict(clip, start_time=round(review["start_time"], 2), end_time=round(review["end_time"], 2))
+        reviewed.append(clip)
+    if logger: logger(f"🔍 Boundary review: {changed} of {len(clips)} clip(s) adjusted, the rest were already right.")
+    return reviewed
 
 
 def _snap_clips_to_pauses(file_path: str, clips: List[Dict[str, Any]], duration: float,
@@ -1080,7 +1171,11 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     if logger and candidates:
         logger(f"🎚️ Selected {len(all_clips)} of {len(candidates)} candidate(s) (density target: {clips_per_hour:g}/hour).")
     raw_lengths = [c["end_time"] - c["start_time"] for c in all_clips]
-    all_clips = [highlights.refine_clip(clip, segments, duration) for clip in all_clips]
+    entries = highlights.build_utterances(segments)
+    if all_clips and settings_cfg.get("review_boundaries", True):
+        all_clips = _review_clip_boundaries(_LLMRoute(config, chat_model), all_clips, entries, duration, logger, is_cancelled, [True])
+        if is_cancelled and is_cancelled(): return False
+    all_clips = [highlights.refine_clip(clip, entries, duration) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
     if is_cancelled and is_cancelled(): return False
     if logger and all_clips:

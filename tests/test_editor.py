@@ -7,6 +7,14 @@ import numpy as np
 
 from src.core import editor
 
+REAL_REVIEW = editor._review_clip_boundaries  # kept so the review tests can call the real function
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_review_in_pipeline_tests(monkeypatch):
+    """process_video tests must never reach an LLM; the review pass has its own tests below."""
+    monkeypatch.setattr(editor, "_review_clip_boundaries", lambda route, clips, *args, **kwargs: clips)
+
 
 # ==============================================================================
 # SANITIZE & AUDIO STREAMS
@@ -931,12 +939,17 @@ def test_process_video_snaps_boundaries_and_logs_lengths(tmp_path, monkeypatch):
     assert any("Clip lengths" in line for line in logs)
 
 
-def test_adjacent_nominations_of_one_moment_merge_up_to_the_configured_cap():
-    raw = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
-           {"start_time": 101, "end_time": 140, "virality_score": 8, "reasoning": "b"}]
-    assert len(editor._clean_and_merge_clips(raw)) == 1  # 140 s <= MAX_MERGED_CLIP_SECONDS
+def test_only_overlapping_nominations_merge_back_to_back_moments_stay_separate():
+    overlapping = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
+                   {"start_time": 90, "end_time": 140, "virality_score": 8, "reasoning": "b"}]
+    merged = editor._clean_and_merge_clips(overlapping)
+    assert len(merged) == 1 and (merged[0]["start_time"], merged[0]["end_time"], merged[0]["virality_score"]) == (0, 140, 8)
+    # two different moments that merely follow each other (a topic change) used to be glued into one clip
+    back_to_back = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "joke about the gestures"},
+                    {"start_time": 101, "end_time": 140, "virality_score": 8, "reasoning": "explaining the new panel"}]
+    assert len(editor._clean_and_merge_clips(back_to_back)) == 2
     too_long = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
-                {"start_time": 101, "end_time": 260, "virality_score": 8, "reasoning": "b"}]
+                {"start_time": 90, "end_time": 260, "virality_score": 8, "reasoning": "b"}]
     assert len(editor._clean_and_merge_clips(too_long)) == 2
 
 
@@ -1044,3 +1057,134 @@ def test_process_video_does_not_export_after_cancel_during_boundary_snapping(tmp
     monkeypatch.setattr("src.core.editor.extract_clips", export)
     assert editor.process_video(str(video), is_cancelled=lambda: state["cancel"]) is False
     export.assert_not_called()
+
+
+# ==============================================================================
+# BOUNDARY REVIEW (PASS 3)
+# ==============================================================================
+def _entries():
+    return [{"start": float(i * 5), "end": float(i * 5 + 4.5), "text": f"line {i}"} for i in range(60)]
+
+
+def _review_route(monkeypatch, replies, prompts=None):
+    calls = iter(replies)
+
+    def fake_create(**kwargs):
+        if prompts is not None:
+            prompts.append(kwargs["messages"][1]["content"])
+        reply = next(calls)
+        if isinstance(reply, Exception):
+            raise reply
+        return _openai_reply(reply)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    return editor._LLMRoute({"openai": {"api_key": "k"}}, "gpt-5.5")
+
+
+def _scenes_reply(scenes, first, last, reason="because"):
+    return json.dumps({"scenes": [{"start_time": a, "end_time": b, "topic": t, "humor": 5} for a, b, t in scenes],
+                       "clip_first": first, "clip_last": last, "reason": reason})
+
+
+def test_review_extends_a_clip_that_lacked_its_setup_and_shows_marked_context(monkeypatch):
+    prompts = []
+    reply = _scenes_reply([(100.0, 115.0, "the question"), (115.0, 160.0, "the joke")], 0, 1, "needs the question before the joke")
+    route = _review_route(monkeypatch, [reply], prompts)
+    clip = {"start_time": 115.0, "end_time": 160.0, "virality_score": 8, "reasoning": "r", "peak_time": 140.0}
+    logs = []
+    result = REAL_REVIEW(route, [clip], _entries(), 300.0, logs.append, None, [True])
+    assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 160.0)
+    assert clip["start_time"] == 115.0  # input untouched
+    assert any("Clip 1: 115-160s -> 100-160s" in line and "needs the question" in line for line in logs)
+    assert any("1 of 1 clip(s) adjusted" in line for line in logs)
+    prompt = prompts[0]
+    assert "from 115.0s to 160.0s" in prompt and "STEP 1" in prompt and "STEP 2" in prompt
+    marked = [line for line in prompt.splitlines() if line.startswith("> ")]
+    assert marked and all(115 - 5 < float(line.split("[")[1].split("s")[0]) < 160 for line in marked)
+    assert any(line.startswith("  [") for line in prompt.splitlines())  # context lines are unmarked
+    assert "[65.0s" not in prompt and "[210.0s" not in prompt  # only +-45 s of context around 115-160
+
+
+def test_review_drops_a_scene_about_another_topic(monkeypatch):
+    """The real case: a joke followed directly by an explanation of a different puzzle was one clip."""
+    scenes = [(90.0, 100.0, "counting"), (100.0, 135.0, "the prayer-gesture joke"), (135.0, 175.0, "describing a new panel")]
+    route = _review_route(monkeypatch, [_scenes_reply(scenes, 1, 1, "the panel is a different topic")])
+    clip = {"start_time": 100.0, "end_time": 175.0, "virality_score": 8, "reasoning": "r", "peak_time": 120.0}
+    result = REAL_REVIEW(route, [clip], _entries(), 300.0, None, None, [True])
+    assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 135.0)
+
+
+def test_review_rejects_unsafe_answers_and_keeps_the_original(monkeypatch):
+    clip = {"start_time": 100.0, "end_time": 140.0, "virality_score": 8, "reasoning": "r", "peak_time": 130.0}
+    ok_scene = (100.0, 140.0, "x")
+    bad_answers = [
+        _scenes_reply([(100.0, 900.0, "way too long")], 0, 0),
+        _scenes_reply([(40.0, 140.0, "moves more than the context window")], 0, 0),
+        _scenes_reply([(100.0, 102.0, "too short")], 0, 0),
+        _scenes_reply([(200.0, 260.0, "a different moment entirely")], 0, 0),
+        _scenes_reply([(150.0, 190.0, "barely overlaps")], 0, 0),
+        _scenes_reply([ok_scene], 0, 3),  # index out of range
+        _scenes_reply([ok_scene, ok_scene], 1, 0),  # first > last
+        _scenes_reply([], 0, 0),
+        json.dumps({"scenes": [{"start_time": "abc", "end_time": 1}], "clip_first": 0, "clip_last": 0}),
+        json.dumps({"clip_first": 0, "clip_last": 0}),
+        "not json at all",
+    ]
+    for answer in bad_answers:
+        route = _review_route(monkeypatch, [answer, answer, answer])
+        result = REAL_REVIEW(route, [clip], _entries(), 300.0, None, None, [True])
+        assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 140.0), answer
+
+
+def test_review_keeps_clips_that_are_already_right_and_survives_api_failures(monkeypatch):
+    clips = [{"start_time": 50.0 + 60 * i, "end_time": 90.0 + 60 * i, "virality_score": 7, "reasoning": "r"} for i in range(4)]
+    replies = [_scenes_reply([(50.0, 90.0, "fine")], 0, 0)] + [RuntimeError("401")] * 6
+    prompts = []
+    route = _review_route(monkeypatch, replies, prompts)
+    logs = []
+    result = REAL_REVIEW(route, clips, _entries(), 400.0, logs.append, None, [True])
+    assert [(c["start_time"], c["end_time"]) for c in result] == [(c["start_time"], c["end_time"]) for c in clips]
+    assert any("0 of 4 clip(s) adjusted" in line for line in logs)
+    # after two failed clips in a row the remaining clips are not sent (no point hammering a broken API)
+    assert len(prompts) == 1 + editor.MAX_REVIEW_FAILURES * editor.LLM_ATTEMPTS
+
+
+def test_review_stops_when_cancelled(monkeypatch):
+    route = _review_route(monkeypatch, [])
+    clips = [{"start_time": 50.0, "end_time": 90.0, "virality_score": 7, "reasoning": "r"}]
+    assert REAL_REVIEW(route, clips, _entries(), 400.0, None, lambda: True, [True]) == clips
+
+
+def test_process_video_runs_the_review_between_selection_and_snapping(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "openai": {"api_key": "k"},
+                   "settings": {"clips_dir": str(tmp_path / "clips"), "review_boundaries": True}, "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 600.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "r"}])
+    order = []
+
+    def review(route, clips, entries, duration, logger, is_cancelled, extra):
+        order.append("review")
+        return [dict(c, start_time=90.0) for c in clips]
+
+    def snap(f, clips, _d, logger):
+        order.append(("snap", clips[0]["start_time"]))
+        return clips
+
+    monkeypatch.setattr(editor, "_review_clip_boundaries", review)
+    monkeypatch.setattr(editor, "_snap_clips_to_pauses", snap)
+    monkeypatch.setattr(editor, "extract_clips", lambda f, data, *a, **k: ["x.mp4"])
+    assert editor.process_video(str(video)) is True
+    assert order == ["review", ("snap", 90.0)]
+
+    order.clear()
+    fake_config["settings"]["review_boundaries"] = False
+    editor.process_video(str(video))
+    assert "review" not in order
