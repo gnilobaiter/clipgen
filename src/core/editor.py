@@ -602,6 +602,21 @@ def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str]
     return [{"start": ev["start"], "end": ev["end"], "text": "", "event": ev["type"], "strength": ev["strength"]} for ev in detected]
 
 
+FALLBACK_WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
+
+
+def get_whisper_models(current: Optional[str] = None) -> List[str]:
+    """Every model the installed openai-whisper can load (tiny.en ... large-v3-turbo), so the UI never drifts
+    from the library. A saved custom value (e.g. a local .pt path) is kept selectable."""
+    try:
+        models = list(whisper.available_models())
+    except Exception:
+        models = list(FALLBACK_WHISPER_MODELS)
+    if current and current not in models:
+        models.append(current)
+    return models
+
+
 LANGUAGE_MAP = {
     "Auto-Detect": None,
     "English": "en",

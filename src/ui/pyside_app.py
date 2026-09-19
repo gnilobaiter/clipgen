@@ -1223,8 +1223,9 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         w_model_label = QtWidgets.QLabel("Whisper Transcribe Model:", whisper_card)
         w_model_label.setProperty("class", "field-label")
         self.whisper_model_combo = QtWidgets.QComboBox(whisper_card)
-        self.whisper_model_combo.addItems(["tiny", "base", "small", "medium", "turbo", "large", "large-v3"])
-        self.whisper_model_combo.setCurrentText(self.config.get("openai", {}).get("whisper_model", "medium"))
+        saved_whisper_model = self.config.get("openai", {}).get("whisper_model", "medium")
+        self.whisper_model_combo.addItems(editor.get_whisper_models(saved_whisper_model))
+        self.whisper_model_combo.setCurrentText(saved_whisper_model)
 
         whisper_layout.addWidget(w_model_label, 1, 0)
         whisper_layout.addWidget(self.whisper_model_combo, 1, 1)

@@ -816,3 +816,14 @@ def test_legacy_migration_noop_without_legacy_file_and_cancel(tmp_path, monkeypa
     editor._save_cached_segments(editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True),
                                  [{"start": 0.0, "end": 5.0, "text": "x"}])
     assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, None, lambda: True) == []
+
+
+def test_get_whisper_models_lists_everything_the_library_can_load(monkeypatch):
+    models = editor.get_whisper_models()
+    assert {"tiny", "base", "small", "medium", "large-v3", "turbo", "large-v3-turbo", "large-v2", "tiny.en"} <= set(models)
+    assert len(models) == len(set(models))
+    assert editor.get_whisper_models("my-local.pt")[-1] == "my-local.pt"
+    assert editor.get_whisper_models("large-v3").count("large-v3") == 1
+
+    monkeypatch.setattr("src.core.editor.whisper.available_models", MagicMock(side_effect=RuntimeError("broken")))
+    assert editor.get_whisper_models("base") == editor.FALLBACK_WHISPER_MODELS

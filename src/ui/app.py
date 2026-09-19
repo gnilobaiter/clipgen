@@ -644,7 +644,7 @@ class ClipGenApp(ctk.CTk):
 
         # Whisper Settings
         ctk.CTkLabel(self.api_card, text="Whisper Transcribe Model:", font=ctk.CTkFont(size=13, weight="bold"), text_color=THEME["text_primary"]).grid(row=6, column=0, padx=20, pady=(14, 4), sticky="w")
-        self.whisper_menu = ctk.CTkOptionMenu(self.api_card, cursor="hand2", values=["tiny", "base", "small", "medium", "large"], height=34, corner_radius=6, fg_color=THEME["bg_card_alt"], button_color=THEME["border_input"], text_color=THEME["text_primary"])
+        self.whisper_menu = ctk.CTkOptionMenu(self.api_card, cursor="hand2", values=editor.get_whisper_models(self.config.get('openai', {}).get('whisper_model', 'base')), height=34, corner_radius=6, fg_color=THEME["bg_card_alt"], button_color=THEME["border_input"], text_color=THEME["text_primary"])
         self.whisper_menu.grid(row=6, column=1, columnspan=2, padx=(0, 16), pady=(14, 4), sticky="ew")
         self.whisper_menu.set(self.config.get('openai', {}).get('whisper_model', 'base'))
         
