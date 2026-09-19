@@ -7,7 +7,7 @@ import re
 import subprocess
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -848,6 +848,11 @@ class _LLMRoute:
             self.openai_base_url = config.get("deepseek", {}).get("base_url", "") or "https://api.deepseek.com"
 
     @property
+    def label(self) -> str:
+        """Engine name for progress messages; DeepSeek also says whether it runs with reasoning."""
+        return f"{self.engine_name} ({'reasoning' if self.thinking else 'fast'})" if self.is_deepseek else self.engine_name
+
+    @property
     def engine_name(self) -> str:
         if self.is_gemini and not self.is_openrouter: return "Gemini"
         if self.is_anthropic: return "Claude"
@@ -950,14 +955,22 @@ def _excerpt(segments: List[Dict[str, Any]], start: float, end: float, limit: in
 
 
 def _rerank_candidates(route: _LLMRoute, candidates: List[Dict[str, Any]], segments: List[Dict[str, Any]], duration: float,
-                       logger: Optional[Callable[[str], None]], extra_body_enabled: List[bool]) -> List[Dict[str, Any]]:
+                       logger: Optional[Callable[[str], None]], extra_body_enabled: List[bool],
+                       is_cancelled: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
     """Pass 2: one short request that puts scores from independently-scored windows on a common scale."""
     items = "\n".join(
         f"id={i} [{c['start_time']:.0f}s-{c['end_time']:.0f}s] section_score={c['virality_score']} why: {c['reasoning']} | transcript: {_excerpt(segments, c['start_time'], c['end_time'])}"
         for i, c in enumerate(candidates)
     )
     prompt = RERANK_PROMPT.format(count=len(candidates), minutes=duration / 60.0, items=items)
-    scores = _request_json(route, RERANK_SYSTEM, prompt, _parse_json_scores, logger, "re-ranking", extra_body_enabled)
+    started = time.monotonic()
+    if logger: logger(f"📨 Re-ranking: asking {route.label} to put the scores of all {len(candidates)} candidates on one scale...")
+    answer = list(_run_batches([0], lambda _n: _request_json(route, RERANK_SYSTEM, prompt, _parse_json_scores, logger, "re-ranking", extra_body_enabled),
+                               1, is_cancelled,
+                               lambda _b, _d, _t: logger(f"⏳ Still waiting for {route.label} to re-rank ({time.monotonic() - started:.0f}s so far)...") if logger else None))
+    scores = answer[0][1] if answer else None
+    if is_cancelled and is_cancelled():
+        return candidates
     if not scores:
         if logger: logger("⚠️ Re-ranking failed - keeping per-section scores.")
         return candidates
@@ -993,8 +1006,13 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
         logger(f"🧠 DeepSeek reasoning mode: {'ON (slower, better decisions)' if route.thinking else 'OFF (fast)'}"
                + (f", {workers} requests in parallel." if workers > 1 else "."))
 
+    timings: Dict[int, float] = {}
+    stage_start = time.monotonic()
+
     def nominate(item: Any) -> Optional[List[Dict[str, Any]]]:
         idx, window = item
+        request_start = time.monotonic()
+        if logger: logger(f"📨 Window {idx}/{len(windows)}: asking {route.label} for the best moments of {window['start'] / 60:.0f}-{window['end'] / 60:.0f} min...")
         transcript = "".join(highlights.format_entry(e) for e in window["lines"])
         overlap_note = ""
         if len(windows) > 1:
@@ -1005,45 +1023,73 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
             overlap_note=overlap_note, want=highlights.requested_candidates(window["end"] - window["start"], clips_per_hour),
             transcript=transcript,
         )
-        return _request_json(route, prompt_text, user_prompt, _parse_json_clips, logger, f"window {idx}/{len(windows)}", extra_body_enabled)
+        found = _request_json(route, prompt_text, user_prompt, _parse_json_clips, logger, f"window {idx}/{len(windows)}", extra_body_enabled)
+        timings[idx] = time.monotonic() - request_start
+        return found
+
+    def waiting(_batch_seconds: float, done: int, total: int) -> None:
+        if logger: logger(f"⏳ Still waiting for {route.label}: {done}/{total} windows answered, {time.monotonic() - stage_start:.0f}s so far (a reasoning model thinks for a while - not frozen).")
 
     candidates: List[Dict[str, Any]] = []
     consecutive_failures = 0
-    for (idx, _window), found in _run_batches(list(enumerate(windows, start=1)), nominate, workers, is_cancelled):
+    for (idx, _window), found in _run_batches(list(enumerate(windows, start=1)), nominate, workers, is_cancelled, waiting):
         consecutive_failures = consecutive_failures + 1 if found is None else 0
+        took = f" ({timings.get(idx, 0):.0f}s)"
         if found:
-            if logger: logger(f"🎯 Window {idx}/{len(windows)}: {len(found)} candidate(s).")
+            if logger: logger(f"🎯 Window {idx}/{len(windows)}: {len(found)} candidate(s){took}.")
             candidates.extend(found)
         elif found is not None and logger:
-            logger(f"🤷‍♂️ Window {idx}/{len(windows)}: no candidates.")
+            logger(f"🤷‍♂️ Window {idx}/{len(windows)}: no candidates{took}.")
         if consecutive_failures >= MAX_CONSECUTIVE_WINDOW_FAILURES:
             if logger: logger(f"❌ {consecutive_failures} windows failed in a row - stopping (check your API key, model name and connection).")
             break
     if is_cancelled and is_cancelled():
+        if logger: logger("🛑 Cancelled - not waiting for the remaining AI answers.")
         return []
 
     candidates = highlights.dedupe_candidates(candidates)
     if len(windows) > 1 and len(candidates) > 3 and not (is_cancelled and is_cancelled()):
         if logger: logger(f"⚖️ Re-ranking {len(candidates)} candidates on a common scale...")
-        candidates = _rerank_candidates(route, candidates, segments, duration, logger, extra_body_enabled)
+        candidates = _rerank_candidates(route, candidates, segments, duration, logger, extra_body_enabled, is_cancelled)
     return candidates
 
 
 LLM_WORKERS = 4  # parallel requests when the reasoning mode makes each one slow
 
 
-def _run_batches(items: List[Any], worker: Callable[[Any], Any], workers: int, is_cancelled: Optional[Callable[[], bool]]):
-    """Yields (item, result) in order, running `worker` on `workers` items at a time in threads. Stops quietly (before
-    starting the next batch) when cancelled; the consumer may also stop early by breaking out of the loop."""
-    for i in range(0, len(items), max(1, workers)):
+HEARTBEAT_SECONDS = 10.0  # how often "still waiting" is logged while requests are in flight
+CANCEL_POLL_SECONDS = 0.5
+
+
+def _run_batches(items: List[Any], worker: Callable[[Any], Any], workers: int, is_cancelled: Optional[Callable[[], bool]],
+                 heartbeat: Optional[Callable[[float, int, int], None]] = None):
+    """Yields (item, result) in order, running `worker` on `workers` items at a time in threads.
+
+    While a batch is in flight this polls the cancel flag twice a second and returns at once when cancelled (the
+    HTTP requests already sent cannot be interrupted and simply finish in the background), and calls
+    `heartbeat(seconds_in_batch, items_done, items_total)` every HEARTBEAT_SECONDS so a slow reasoning model does not
+    look frozen. The consumer may also stop early by breaking out of the loop."""
+    total, done_total = len(items), 0
+    for i in range(0, total, max(1, workers)):
         if is_cancelled and is_cancelled():
             return
         batch = items[i:i + max(1, workers)]
-        if len(batch) == 1:
-            results = [worker(batch[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-                results = list(pool.map(worker, batch))
+        pool = ThreadPoolExecutor(max_workers=len(batch))
+        futures = [pool.submit(worker, item) for item in batch]
+        pending = set(futures)
+        started = last_beat = time.monotonic()
+        while pending:
+            _done, pending = wait(pending, timeout=min(CANCEL_POLL_SECONDS, HEARTBEAT_SECONDS))
+            if is_cancelled and is_cancelled():
+                pool.shutdown(wait=False, cancel_futures=True)
+                return
+            now = time.monotonic()
+            if pending and heartbeat and now - last_beat >= HEARTBEAT_SECONDS:
+                heartbeat(now - started, done_total + len(batch) - len(pending), total)
+                last_beat = now
+        pool.shutdown(wait=True)
+        results = [f.result() for f in futures]
+        done_total += len(batch)
         yield from zip(batch, results)
 
 
@@ -1120,8 +1166,13 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
         mode = f" (reasoning {'ON' if route.thinking else 'OFF'}, {workers} in parallel)" if route.is_deepseek else ""
         logger(f"🔍 Reviewing the boundaries of {len(clips)} clip(s){mode}...")
 
+    timings: Dict[int, float] = {}
+    stage_start = time.monotonic()
+
     def review_one(item: Any) -> Optional[Dict[str, Any]]:
         i, clip = item
+        request_start = time.monotonic()
+        if logger: logger(f"📨 Clip {i}/{len(clips)}: asking {route.label} whether {clip['start_time']:.0f}-{clip['end_time']:.0f}s is a complete, self-contained moment...")
         lo, hi = clip["start_time"] - REVIEW_CONTEXT, clip["end_time"] + REVIEW_CONTEXT
         excerpt = "".join(("> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ") + highlights.format_entry(e)
                           for e in entries if e["end"] > lo and e["start"] < hi)
@@ -1130,24 +1181,33 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
                       "the punchline understandable: unless it is a complete joke on its own, start EARLIER and include the scene(s) that set it up."
                       if length < 2 * highlights.MIN_CONTEXT_SECONDS else "")
         prompt = REVIEW_PROMPT.format(lo=lo, hi=hi, start=clip["start_time"], end=clip["end_time"], excerpt=excerpt, short_note=short_note)
-        return _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
+        review = _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
+        timings[i] = time.monotonic() - request_start
+        return review
+
+    def waiting(_batch_seconds: float, done: int, total: int) -> None:
+        if logger: logger(f"⏳ Still waiting for {route.label}: {done}/{total} clips reviewed, {time.monotonic() - stage_start:.0f}s so far (not frozen).")
 
     reviewed: List[Dict[str, Any]] = []
     failures = changed = 0
-    for (i, clip), review in _run_batches(list(enumerate(clips, start=1)), review_one, workers, is_cancelled):
+    for (i, clip), review in _run_batches(list(enumerate(clips, start=1)), review_one, workers, is_cancelled, waiting):
+        took = f" ({timings.get(i, 0):.0f}s)"
         if review is None:
             failures += 1
         else:
             failures = 0
             if _accept_review(clip, review, duration) and (abs(review["start_time"] - clip["start_time"]) > 0.5 or abs(review["end_time"] - clip["end_time"]) > 0.5):
                 changed += 1
-                if logger: logger(f"🔍 Clip {i}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s ({review['reason'][:110]})")
+                if logger: logger(f"🔍 Clip {i}/{len(clips)}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s{took} - {review['reason'][:100]}")
                 clip = dict(clip, start_time=round(review["start_time"], 2), end_time=round(review["end_time"], 2))
+            elif logger:
+                logger(f"🔍 Clip {i}/{len(clips)}: boundaries kept{took}.")
         reviewed.append(clip)
         if failures >= MAX_REVIEW_FAILURES:
             if logger: logger("⚠️ The boundary review keeps failing - keeping the remaining clips as they are.")
             break
     if is_cancelled and is_cancelled():
+        if logger: logger("🛑 Cancelled - not waiting for the remaining AI answers.")
         return clips
     reviewed.extend(clips[len(reviewed):])
     if logger: logger(f"🔍 Boundary review: {changed} of {len(clips)} clip(s) adjusted, the rest were already right.")

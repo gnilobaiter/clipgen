@@ -1098,7 +1098,7 @@ def test_review_extends_a_clip_that_lacked_its_setup_and_shows_marked_context(mo
     result = REAL_REVIEW(route, [clip], _entries(), 300.0, logs.append, None, [True])
     assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 160.0)
     assert clip["start_time"] == 115.0  # input untouched
-    assert any("Clip 1: 115-160s -> 100-160s" in line and "needs the question" in line for line in logs)
+    assert any("Clip 1/1: 115-160s -> 100-160s" in line and "needs the question" in line for line in logs)
     assert any("1 of 1 clip(s) adjusted" in line for line in logs)
     prompt = prompts[0]
     assert "from 115.0s to 160.0s" in prompt and "STEP 1" in prompt and "STEP 2" in prompt
@@ -1416,3 +1416,102 @@ def test_parallel_review_keeps_clip_order_and_stops_after_repeated_failures(monk
     assert all(r["start_time"] == c["start_time"] for r, c in zip(result[1:], clips[1:]))
     assert any("reasoning ON, 4 in parallel" in line for line in logs)
     assert any("keeps failing" in line for line in logs)
+
+
+# ==============================================================================
+# PROGRESS MESSAGES AND IMMEDIATE CANCEL WHILE THE AI IS THINKING
+# ==============================================================================
+def test_heartbeat_fires_while_a_slow_batch_is_in_flight(monkeypatch):
+    import time
+
+    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.15)
+    beats = []
+
+    def slow(x):
+        time.sleep(0.6)
+        return x
+
+    results = list(editor._run_batches([1, 2, 3], slow, 3, None, lambda seconds, done, total: beats.append((round(seconds, 1), done, total))))
+    assert [r for _i, r in results] == [1, 2, 3]
+    assert len(beats) >= 2 and all(total == 3 and done == 0 for _s, done, total in beats)
+    assert beats == sorted(beats)  # elapsed time only grows
+
+
+def test_cancel_returns_immediately_even_though_requests_are_still_in_flight():
+    import time
+
+    state = {"cancel": False}
+    started = time.monotonic()
+
+    def slow(x):
+        time.sleep(3.0)  # an AI request that would take 3 s to answer
+        return x
+
+    def cancel():
+        return time.monotonic() - started > 0.3
+
+    out = list(editor._run_batches([1, 2, 3, 4], slow, 4, cancel))
+    assert out == [] and time.monotonic() - started < 1.5  # returned long before the requests finished
+    assert state["cancel"] is False
+
+
+def test_windows_log_start_duration_and_the_still_waiting_message(monkeypatch):
+    import time
+
+    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.1)
+
+    def fake_create(**kwargs):
+        time.sleep(0.4)
+        user = kwargs["messages"][1]["content"]
+        if user.startswith("Below are"):
+            n = user.count("\nid=") + 1
+            return _openai_reply(json.dumps({"scores": [{"id": i, "score": 8} for i in range(n)]}))
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 7, "reasoning": "x"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    config = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek", "settings": {"deepseek_thinking": True}}
+    logs = []
+    editor._generate_clips_with_llm(_long_segments(40), config, "deepseek-v4-flash", "P", logs.append)
+    starts = [line for line in logs if line.startswith("📨 Window")]
+    assert len(starts) == 4 and all("DeepSeek (reasoning)" in line for line in starts)
+    assert any("Still waiting for DeepSeek (reasoning): 0/4 windows answered" in line and "not frozen" in line for line in logs)
+    assert any(line.startswith("🎯 Window 1/4") and "s)." in line for line in logs)  # each answer shows how long it took
+    assert any("📨 Re-ranking: asking DeepSeek (reasoning)" in line for line in logs)
+
+
+def test_review_logs_every_clip_and_cancel_stops_waiting(monkeypatch):
+    import time
+
+    def fake_create(**kwargs):
+        time.sleep(0.2)
+        user = kwargs["messages"][1]["content"]
+        if "from 50.0s to 90.0s" in user:
+            return _openai_reply(_scenes_reply([(20.0, 60.0, "setup"), (60.0, 90.0, "joke")], 0, 1, "needs the setup"))
+        return _openai_reply(_scenes_reply([(150.0, 190.0, "same")], 0, 0))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    route = editor._LLMRoute({"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek"}, "deepseek-v4-flash")
+    clips = [{"start_time": 50.0, "end_time": 90.0, "virality_score": 7, "reasoning": "r"},
+             {"start_time": 150.0, "end_time": 190.0, "virality_score": 7, "reasoning": "r"}]
+    logs = []
+    REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, None, [True])
+    assert sum(line.startswith("📨 Clip") for line in logs) == 2
+    assert any("Clip 1/2: 50-90s -> 20-90s" in line and "needs the setup" in line for line in logs)
+    assert any("Clip 2/2: boundaries kept" in line for line in logs)
+
+    slow_started = time.monotonic()
+
+    def very_slow(**kwargs):
+        time.sleep(3.0)
+        return _openai_reply("{}")
+
+    mock_client.chat.completions.create.side_effect = very_slow
+    logs.clear()
+    result = REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, lambda: time.monotonic() - slow_started > 0.3, [True])
+    assert result == clips and time.monotonic() - slow_started < 2.0
+    assert any("Cancelled" in line for line in logs)
