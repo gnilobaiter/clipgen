@@ -17,6 +17,7 @@ import whisper
 from src.core import audio_events, cuts, highlights
 from src.core import config as config_manager
 from src.utils.hardware import get_hardware_status, log_hardware_info
+from src.utils.log_style import stage_header
 from src.utils.paths import get_app_data_path, get_ffmpeg_path, get_ffprobe_path, inject_bin_to_path
 
 # openai-whisper tries Triton GPU kernels for word timestamps (median filter, DTW). Triton does not exist on Windows,
@@ -1203,6 +1204,11 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
     return reviewed
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
 def _snap_clips_to_pauses(file_path: str, clips: List[Dict[str, Any]], duration: float,
                           logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
     """Moves every clip start/end into a nearby pause in the audio so no word is cut in half."""
@@ -1225,7 +1231,16 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
         if logger: logger(f"❌ Error: Source video file not found: {file_path}")
         return False
 
+    run_started = time.monotonic()
     config = config_manager.load_config()
+    review_enabled = bool(config.get("settings", {}).get("review_boundaries", True))
+    total_stages = 3 + (1 if review_enabled else 0)
+    stage_number = [0]
+
+    def stage(icon: str, title: str) -> None:
+        stage_number[0] += 1
+        if logger: logger(stage_header(stage_number[0], total_stages, icon, title))
+
     active_prov = config.get("active_ai_provider", "openai")
     if active_prov == "deepseek":
         chat_model = config.get("deepseek_model", "deepseek-v4-flash")
@@ -1250,6 +1265,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     if not _validate_api_keys(config, chat_model, logger):
         return False
 
+    stage("🎙️", "Transcript & audio")
     segments = _transcribe_audio_to_segments(file_path, config, logger, is_cancelled)
     if not segments:
         return False
@@ -1258,6 +1274,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
 
     prompt_text = config.get("prompts", {}).get("profiles", {}).get(prompt_profile, "Find the best 15-90s moments. Output JSON.")
 
+    stage("🤖", "AI finds and ranks the best moments")
     candidates = _generate_clips_with_llm(segments, config, chat_model, prompt_text, logger, is_cancelled)
     if is_cancelled and is_cancelled(): return False
 
@@ -1275,8 +1292,11 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     raw_lengths = [c["end_time"] - c["start_time"] for c in all_clips]
     entries = highlights.build_utterances(segments)
     if all_clips and settings_cfg.get("review_boundaries", True):
+        stage("🔍", "AI reviews the clip boundaries")
         all_clips = _review_clip_boundaries(_LLMRoute(config, chat_model), all_clips, entries, duration, logger, is_cancelled, [True])
         if is_cancelled and is_cancelled(): return False
+    if all_clips:
+        stage("✂️", "Cutting & exporting")
     all_clips = [highlights.extend_short_clip(clip, entries) for clip in all_clips]
     all_clips = [highlights.limit_length(highlights.refine_clip(clip, entries, duration)) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
@@ -1290,7 +1310,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
         if logger: logger(f"🎬 Sending {len(all_clips)} total timestamp(s) to FFmpeg...")
         final_clips_data = {"clips": all_clips}
         created = extract_clips(file_path, final_clips_data, clips_dir, logger, is_cancelled)
-        if logger: logger(f"✨ Successfully exported {len(created)} file(s) to your folder!")
+        if logger: logger(f"✨ Successfully exported {len(created)} file(s) to your folder! (total {_format_duration(time.monotonic() - run_started)})")
         return True
     else:
         if logger: logger("🤷‍♂️ AI finished scanning the VOD but didn't extract any clips.")

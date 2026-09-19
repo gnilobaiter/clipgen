@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from src.core import config as config_manager
 from src.core import editor
 from src.services import model_fetcher
+from src.utils import log_style
 from src.utils.hardware import get_hardware_status
 from src.utils.paths import get_app_data_path, inject_bin_to_path
 
@@ -797,24 +798,8 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
 
     def log_to_console(self, text: str, source: str = "system"):
         clean_msg = text.strip()
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if clean_msg.startswith("[") and "]" in clean_msg[:25]:
-            display_text = clean_msg
-        else:
-            display_text = f"[{timestamp}] {clean_msg}"
+        html = log_style.to_html(clean_msg, datetime.datetime.now().strftime("%H:%M:%S"))
 
-        color_hex = "#f1f5f9"
-        if "❌" in clean_msg or "error" in clean_msg.lower():
-            color_hex = "#f87171"
-        elif "✅" in clean_msg or "✨" in clean_msg or "🏁" in clean_msg:
-            color_hex = "#34d399"
-        elif "🧠" in clean_msg or "🌌" in clean_msg or "🤖" in clean_msg or "🎯" in clean_msg or "🚀" in clean_msg or "⚡" in clean_msg:
-            color_hex = "#38bdf8"
-        elif "✂️" in clean_msg or "🎞️" in clean_msg or "📸" in clean_msg or "📱" in clean_msg:
-            color_hex = "#fbbf24"
-
-        html = f'<span style="color:{color_hex};">{display_text}</span>'
-        
         # Smooth autoscroll without viewport jumping
         scrollbar = self.console_text.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= (scrollbar.maximum() - 25)

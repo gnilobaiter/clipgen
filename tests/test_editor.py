@@ -1532,3 +1532,51 @@ def test_review_logs_only_changes_and_cancel_stops_waiting(monkeypatch):
     result = REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, lambda: time.monotonic() - slow_started > 0.3, [True])
     assert result == clips and time.monotonic() - slow_started < 2.0
     assert any("Cancelled" in line for line in logs)
+
+
+# ==============================================================================
+# STRUCTURED LOG: STAGE HEADERS AND TOTAL TIME
+# ==============================================================================
+def _stage_run(tmp_path, monkeypatch, review, with_clips=True):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips"), "review_boundaries": review},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 600.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "r"}] if with_clips else [])
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses", lambda f, clips, _d, logger: clips)
+    monkeypatch.setattr("src.core.editor.extract_clips", lambda f, data, *a, **k: ["x.mp4"])
+    logs = []
+    editor.process_video(str(video), logger=logs.append)
+    return logs
+
+
+def test_pipeline_log_is_divided_into_numbered_stages(tmp_path, monkeypatch):
+    logs = _stage_run(tmp_path, monkeypatch, review=True)
+    headers = [line for line in logs if line.startswith("══")]
+    assert headers == ["══ 1/4 · 🎙️ Transcript & audio ══", "══ 2/4 · 🤖 AI finds and ranks the best moments ══",
+                       "══ 3/4 · 🔍 AI reviews the clip boundaries ══", "══ 4/4 · ✂️ Cutting & exporting ══"]
+    order = [logs.index(h) for h in headers]
+    assert order == sorted(order)
+    assert any("Selected 1 of 1" in line for line in logs[order[1]:order[2]])  # the selection line sits under the AI stage
+    assert any("Clip lengths" in line for line in logs[order[3]:])
+    assert any(line.startswith("✨ Successfully exported 1 file(s)") and "(total " in line for line in logs)
+
+
+def test_stage_count_shrinks_when_the_review_is_off_and_nothing_to_cut(tmp_path, monkeypatch):
+    logs = _stage_run(tmp_path, monkeypatch, review=False)
+    assert [line for line in logs if line.startswith("══")] == ["══ 1/3 · 🎙️ Transcript & audio ══", "══ 2/3 · 🤖 AI finds and ranks the best moments ══",
+                                                              "══ 3/3 · ✂️ Cutting & exporting ══"]
+
+
+def test_no_clips_means_no_cutting_stage(tmp_path, monkeypatch):
+    logs = _stage_run(tmp_path, monkeypatch, review=True, with_clips=False)
+    headers = [line for line in logs if line.startswith("══")]
+    assert len(headers) == 2 and not any("Cutting" in h for h in headers)
+
+
+def test_format_duration():
+    assert editor._format_duration(42.4) == "42s" and editor._format_duration(60) == "1m 00s" and editor._format_duration(372.6) == "6m 13s"

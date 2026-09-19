@@ -55,6 +55,7 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 ### 🖥️ Desktop Workstation
 * **Modern Dark UI:** Built with CustomTkinter for a sleek, responsive interface.
 * **Batch Video Clipper:** Select and process local video files or recordings in an efficient queue.
+* **Structured, colour-coded log console:** the run is divided into numbered stages (`══ 2/4 · 🤖 AI finds and ranks the best moments ══`), details hang under their stage, and colours mean the same everywhere: cyan = transcription/audio, violet = AI, teal = selection and statistics, orange = cutting/export, green = success, amber = warning/cancel, red = error, grey = background progress. Log text is shown literally (never interpreted as HTML), and the final line reports the total run time.
 * **Built-in Clip Gallery:** Review clips directly in the application, sort by Date or Virality Score, view AI reasoning notes, play video highlights, and batch delete unwanted cuts.
 * **Discord Webhook Alerts:** Sends rich notifications to your Discord channels when clipping jobs complete.
 

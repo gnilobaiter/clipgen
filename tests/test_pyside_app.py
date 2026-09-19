@@ -279,3 +279,21 @@ def test_pyside_worker_stops_the_queue_after_cancel(tmp_path, monkeypatch):
     monkeypatch.setattr("src.ui.pyside_app.editor.process_video", fake_process_video)
     worker.run()
     assert processed == ["a.mp4"]
+
+
+@pytest.mark.usefixtures("qapp")
+def test_console_shows_structure_colours_and_never_interprets_log_text_as_html(temp_config_env):
+    window = ClipGenPySideApp()
+    window._clear_console()
+    window.log_to_console("══ 2/4 · 🤖 AI finds and ranks the best moments ══", "manual")
+    window.log_to_console("🎯 Window 1/8: 5 candidate(s) (34s)", "manual")
+    window.log_to_console("⏳ Processed up to 01:02: <b>bold</b> & co", "manual")
+    window.log_to_console("✅ [1/18] Rendered: clip.mp4", "manual")
+
+    text = window.console_text.toPlainText()
+    assert "══ 2/4 · 🤖 AI finds and ranks the best moments ══" in text
+    assert "│ 🎯 Window 1/8: 5 candidate(s) (34s)" in text  # details hang under their stage
+    assert "<b>bold</b> & co" in text  # shown literally, not rendered as bold
+    html = window.console_text.document().toHtml()
+    assert "#a78bfa" in html and "#34d399" in html and "#64748b" in html  # AI violet, success green, dim grey
+    window.close()
