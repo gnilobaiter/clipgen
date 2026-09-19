@@ -21,20 +21,19 @@ logger = logging.getLogger("model_fetcher")
 
 # Curated list of "main" models for each provider
 MAIN_MODELS = {
-    "openai": ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini", "gpt-4-turbo"],
-    "anthropic": ["claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"],
+    "openai": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini", "o3-mini"],
+    "anthropic": ["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5-20251001"],
     "google": [
-        "gemini-2.5-flash", "gemini-2.5-pro", 
-        "gemini-3.1-pro", "gemini-3-flash", 
-        "gemini-2.0-flash"
+        "gemini-3.5-flash", "gemini-3.1-pro",
+        "gemini-2.5-flash", "gemini-2.5-pro"
     ],
-    "xai": ["grok-2-latest", "grok-2-mini"],
+    "xai": ["grok-4.3", "grok-4.6", "grok-4-1-fast-non-reasoning", "grok-4-1-fast-reasoning"],
     "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"]
 }
 
 # Keywords for filtering common chat models (if not using whitelisted-only)
 INCLUDE_KEYWORDS = [
-    "gpt-4", "gpt-3.5", "claude-3", "claude-2", "gemini", 
+    "gpt-", "o1", "o3", "o4", "claude-", "gemini", 
     "grok", "llama", "deepseek", "mistral", "mixtral", 
     "command-r", "phi-3", "qwen", "perplex"
 ]

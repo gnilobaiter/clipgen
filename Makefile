@@ -9,7 +9,7 @@ VENV_DIR := .venv
 endif
 
 install: $(VENV_PYTHON)
-	uv pip install -p $(VENV_DIR) --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
+	uv pip install -p $(VENV_DIR) --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
 
 $(VENV_PYTHON):
 	uv venv --clear $(VENV_DIR)

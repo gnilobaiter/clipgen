@@ -96,21 +96,27 @@ def test_extract_audio_hidden_failure(monkeypatch):
 
 def test_enhance_segments_with_audio_analysis():
     segments = [
-        {"start": 0.0, "end": 1.0, "text": "calm dialogue"},
-        {"start": 1.0, "end": 2.0, "text": "screaming explosion"}
+        {"start": 0.0, "end": 4.0, "text": "calm dialogue"},
+        {"start": 4.0, "end": 6.0, "text": "screaming explosion"}
     ]
-    # 2 seconds of 16kHz audio: 1st sec calm, 2nd sec loud with spike
-    audio = np.zeros(32000, dtype=np.float32)
-    audio[0:16000] = 0.05
-    audio[16000:32000] = 0.8
-    # Spike for combat transient
-    audio[20000:20200] = 1.0
+    # 6 seconds of 16kHz audio: quiet background, then a loud burst with a sharp spike
+    audio = np.full(96000, 0.02, dtype=np.float32)
+    audio[64000:96000] = 0.8
+    audio[70000:70200] = 1.0
 
     enhanced = editor.analyze_audio_peaks(
         audio, segments, sample_rate=16000, peak_detection=True, combat_detection=True
     )
-    assert "[LOUDNESS:" in enhanced[0]["text"]
-    assert "[LOUDNESS: 100%]" in enhanced[1]["text"]
+    assert enhanced[0]["text"] == "calm dialogue"  # text is never polluted with tags
+    assert enhanced[0]["loudness"] < 10
+    assert enhanced[1]["loudness"] == 100
+
+
+def test_analyze_audio_peaks_flags_disabled():
+    audio = np.full(16000, 0.1, dtype=np.float32)
+    enhanced = editor.analyze_audio_peaks(audio, [{"start": 0.0, "end": 1.0, "text": "x"}], peak_detection=False, combat_detection=False)
+    assert "loudness" not in enhanced[0]
+    assert enhanced[0]["is_combat"] is False
 
 
 # ==============================================================================
@@ -456,3 +462,281 @@ def test_transcribe_audio_full_success(tmp_path, monkeypatch):
     result = editor._transcribe_audio_to_segments(str(video), config, logger=logs.append, is_cancelled=None)
     assert result is not None
     assert len(result) == 1
+
+
+# ==============================================================================
+# WINDOWED LLM PIPELINE, RE-RANKING, SELECTION
+# ==============================================================================
+def _openai_reply(payload: str):
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = payload
+    return resp
+
+
+def _long_segments(minutes: int = 40):
+    return [{"start": float(i * 10), "end": float(i * 10 + 10), "text": f"line {i}"} for i in range(minutes * 6)]
+
+
+def _window_index(user_prompt: str) -> int:
+    return int(user_prompt.split("part ")[1].split(" ")[0])
+
+
+def test_parse_json_clips_keeps_peak_time():
+    raw = '{"clips": [{"start_time": 10, "end_time": 30, "peak_time": 22.5, "virality_score": 8, "reasoning": "x"}]}'
+    clips = editor._parse_json_clips(raw)
+    assert clips[0]["peak_time"] == 22.5
+    assert "peak_time" not in editor._parse_json_clips('{"clips": [{"start_time": 1, "end_time": 9, "virality_score": 7}]}')[0]
+
+
+def test_parse_json_scores():
+    assert editor._parse_json_scores('{"scores": [{"id": 0, "score": 12}, {"id": 1, "score": 4}, {"bad": 1}]}') == {0: 10, 1: 4}
+    assert editor._parse_json_scores('[{"id": 2, "score": 7}]') == {2: 7}
+    assert editor._parse_json_scores("nope") is None
+    assert editor._parse_json_scores('{"scores": []}') is None
+
+
+def test_long_video_is_split_into_windows_and_reranked(monkeypatch):
+    prompts = []
+
+    def fake_create(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        prompts.append(user)
+        if user.startswith("Below are"):
+            n = user.count("\nid=") + 1
+            return _openai_reply(json.dumps({"scores": [{"id": i, "score": 9} for i in range(n)]}))
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [
+            {"start_time": start, "end_time": start + 30, "peak_time": start + 20, "virality_score": 7, "reasoning": "x"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+
+    config = {"openai": {"api_key": "k", "base_url": ""}, "settings": {"clips_per_hour": 12}}
+    logs = []
+    clips = editor._generate_clips_with_llm(_long_segments(40), config, "gpt-5.5", "SYSTEM", logs.append)
+
+    window_prompts = [p for p in prompts if not p.startswith("Below are")]
+    assert len(window_prompts) >= 4
+    assert "overlap" in window_prompts[0]
+    assert any(p.startswith("Below are") for p in prompts)
+    assert len(clips) >= 4 and all(c["virality_score"] == 9 for c in clips)
+    assert any("Re-ranking" in line for line in logs)
+
+
+def test_rerank_failure_keeps_original_scores(monkeypatch):
+    def fake_create(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        if user.startswith("Below are"):
+            return _openai_reply("garbage")
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 8, "reasoning": "x"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    logs = []
+    clips = editor._generate_clips_with_llm(_long_segments(40), {"openai": {"api_key": "k"}}, "gpt-5.5", "SYS", logs.append)
+    assert len(clips) >= 4 and all(c["virality_score"] == 8 for c in clips)
+    assert any("Re-ranking failed" in line for line in logs)
+
+
+def test_window_failure_does_not_abort_other_windows(monkeypatch):
+    def fake_create(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        if user.startswith("Below are"):
+            return _openai_reply("garbage")
+        if _window_index(user) == 1:
+            raise RuntimeError("boom")
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 8, "reasoning": "ok"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    logs = []
+    clips = editor._generate_clips_with_llm(_long_segments(40), {"openai": {"api_key": "k"}}, "gpt-5.5", "SYS", logs.append)
+    assert len(clips) >= 3
+    assert any("API Error (window 1/" in line for line in logs)
+
+
+def test_cancel_stops_window_loop(monkeypatch):
+    mock_client = MagicMock()
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    clips = editor._generate_clips_with_llm(_long_segments(40), {"openai": {"api_key": "k"}}, "gpt-5.5", "SYS", None, lambda: True)
+    assert clips == []
+    mock_client.chat.completions.create.assert_not_called()
+
+
+def test_anthropic_output_budget_stays_non_streaming(monkeypatch):
+    mock_client = MagicMock()
+    block = MagicMock()
+    block.text = '{"clips": [{"start_time": 2.0, "end_time": 20.0, "virality_score": 8, "reasoning": "f"}]}'
+    mock_client.messages.create.return_value = MagicMock(content=[block])
+    monkeypatch.setattr("anthropic.Anthropic", lambda **kwargs: mock_client)
+
+    editor._generate_clips_with_llm([{"start": 0.0, "end": 30.0, "text": "speech"}], {"anthropic": {"api_key": "k"}}, "claude-sonnet-5", "P", None)
+    kwargs = mock_client.messages.create.call_args[1]
+    assert kwargs["max_tokens"] == editor.ANTHROPIC_MAX_OUTPUT_TOKENS
+    # the SDK raises for non-streaming requests whose max_tokens implies > 10 minutes (3600 * max_tokens / 128000)
+    assert 3600 * kwargs["max_tokens"] / 128_000 <= 600
+
+
+def test_deepseek_extra_body_dropped_after_rejection(monkeypatch):
+    seen = []
+
+    def fake_create(**kwargs):
+        seen.append("extra_body" in kwargs)
+        if len(seen) == 1:
+            raise RuntimeError("unknown field: thinking")
+        return _openai_reply('{"clips": [{"start_time": 1.0, "end_time": 15.0, "virality_score": 7, "reasoning": "x"}]}')
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    config = {"openai": {"api_key": "k", "base_url": "https://proxy.example/deepseek"}}
+    clips = editor._generate_clips_with_llm([{"start": 0.0, "end": 30.0, "text": "speech"}], config, "deepseek-v4-flash", "P", None)
+    assert seen == [True, False] and len(clips) == 1
+
+
+def test_route_detection():
+    r = editor._LLMRoute({"openai": {"api_key": "a"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek"}, "deepseek-v4-flash")
+    assert r.is_deepseek and r.openai_key == "d" and r.openai_base_url == "https://api.deepseek.com"
+    assert editor._LLMRoute({}, "gemini-3.5-flash").engine_name == "Gemini"
+    assert editor._LLMRoute({}, "claude-sonnet-5").engine_name == "Claude"
+    assert editor._LLMRoute({"openai": {"base_url": "https://openrouter.ai/api/v1"}}, "x/y").engine_name == "Custom Base URL"
+    grok = editor._LLMRoute({"xai": {"api_key": "x"}}, "grok-4.3")
+    assert grok.is_grok and grok.openai_base_url == "https://api.x.ai/v1" and grok.openai_key == "x"
+
+
+def test_process_video_selects_by_density_and_refines(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {
+        "active_ai_provider": "openai", "openai_model": "gpt-4o",
+        "settings": {"clips_dir": str(tmp_path / "clips"), "clips_per_hour": 2, "min_clip_score": 6},
+        "prompts": {"profiles": {"Default": "Prompt"}},
+    }
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    segments = [{"start": float(i * 100), "end": float(i * 100 + 90), "text": "talk"} for i in range(36)]  # 1 hour
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: segments)
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0 + i * 500, "end_time": 130.0 + i * 500, "virality_score": 6 + i % 4, "reasoning": "r"} for i in range(7)
+    ])
+    captured = {}
+
+    def fake_extract(input_file, clips_data, *args, **kwargs):
+        captured["clips"] = clips_data["clips"]
+        return ["a.mp4"] * len(clips_data["clips"])
+
+    monkeypatch.setattr("src.core.editor.extract_clips", fake_extract)
+    logs = []
+    assert editor.process_video(str(video), logger=logs.append) is True
+    assert len(captured["clips"]) == 2
+    assert sorted(c["virality_score"] for c in captured["clips"]) == [8, 9]
+    assert any("Selected 2 of 7" in line for line in logs)
+
+
+def test_process_video_cancel_after_llm(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path)}, "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 10.0, "text": "x"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [])
+    state = {"n": 0}
+
+    def cancelled():
+        state["n"] += 1
+        return state["n"] >= 2
+
+    assert editor.process_video(str(video), is_cancelled=cancelled) is False
+
+
+# ==============================================================================
+# TRANSCRIPTION: EVENTS, WORD TIMESTAMPS, CACHE VERSION
+# ==============================================================================
+def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    mock_model = MagicMock()
+    mock_model.transcribe.return_value = {"segments": [{
+        "id": 0, "seek": 0, "tokens": [1, 2, 3], "start": 0.0, "end": 5.0, "text": " GG WP",
+        "words": [{"word": " GG", "start": 0.1, "end": 0.6, "probability": 0.9}],
+    }]}
+    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *a, **k: mock_model)
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000 * 10, dtype=np.float32))
+    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio: [
+        {"type": "LAUGHTER", "start": 1.0, "end": 4.0, "strength": 80}])
+
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"}, "settings": {"audio_peak_detection": True, "combat_detection": False}}
+    result = editor._transcribe_audio_to_segments(str(video), config, logger=None, is_cancelled=None)
+
+    assert mock_model.transcribe.call_args[1]["word_timestamps"] is True
+    assert sorted(bool(e.get("event")) for e in result) == [False, True]
+    speech = next(e for e in result if not e.get("event"))
+    assert "tokens" not in speech and speech["words"] == [{"word": " GG", "start": 0.1, "end": 0.6}]
+    assert "loudness" in speech
+
+
+def test_event_detection_failure_is_not_fatal(monkeypatch):
+    def boom(audio):
+        raise ValueError("bad audio")
+
+    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", boom)
+    logs = []
+    assert editor._detect_events_safe(np.zeros(10, dtype=np.float32), logs.append) == []
+    assert any("skipped" in line for line in logs)
+
+
+def test_transcript_cache_key_is_versioned(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path))
+    video = tmp_path / "v.mp4"
+    video.write_text("x")
+    before = editor._get_transcription_cache_path(str(video), "base", "en", True, True)
+    monkeypatch.setattr("src.core.editor.TRANSCRIPT_CACHE_VERSION", editor.TRANSCRIPT_CACHE_VERSION + 1)
+    assert editor._get_transcription_cache_path(str(video), "base", "en", True, True) != before
+
+
+def test_rerank_uses_dedicated_system_prompt_not_the_clip_extraction_prompt(monkeypatch):
+    systems = {}
+
+    def fake_create(**kwargs):
+        system, user = kwargs["messages"][0]["content"], kwargs["messages"][1]["content"]
+        if user.startswith("Below are"):
+            systems["rerank"] = system
+            n = user.count("\nid=") + 1
+            return _openai_reply(json.dumps({"scores": [{"id": i, "score": 8} for i in range(n)]}))
+        systems["window"] = system
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 7, "reasoning": "x"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    editor._generate_clips_with_llm(_long_segments(40), {"openai": {"api_key": "k"}}, "gpt-5.5", "CLIP-EXTRACTION-PROMPT", None)
+    assert systems["window"] == "CLIP-EXTRACTION-PROMPT"
+    assert systems["rerank"] == editor.RERANK_SYSTEM
+
+
+def test_generation_stops_after_consecutive_window_failures(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = RuntimeError("401 invalid api key")
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    logs = []
+    clips = editor._generate_clips_with_llm(_long_segments(40), {"openai": {"api_key": "bad"}}, "gpt-5.5", "P", logs.append)
+    assert clips == []
+    assert mock_client.chat.completions.create.call_count == editor.MAX_CONSECUTIVE_WINDOW_FAILURES * editor.LLM_ATTEMPTS
+    assert any("windows failed in a row" in line for line in logs)

@@ -502,7 +502,7 @@ class ClipGenApp(ctk.CTk):
 
         self.openai_model_label = ctk.CTkLabel(self.openai_frame, text="AI Model:", font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_secondary"])
         self.openai_model_menu = ctk.CTkComboBox(self.openai_frame, cursor="hand2", values=model_fetcher.MAIN_MODELS["openai"], height=32, width=260)
-        self.openai_model_menu.set(self.config.get("openai_model", "gpt-4o"))
+        self.openai_model_menu.set(self.config.get("openai_model", "gpt-5.5"))
         
         self.base_url_label = ctk.CTkLabel(self.openai_frame, text="Base URL:", font=ctk.CTkFont(size=11), text_color=THEME["text_muted"])
         self.base_url_label.grid(row=2, column=0, padx=(36, 10), pady=(4, 12), sticky="w")
@@ -574,7 +574,7 @@ class ClipGenApp(ctk.CTk):
 
         self.anthropic_model_label = ctk.CTkLabel(self.anthropic_frame, text="AI Model:", font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_secondary"])
         self.anthropic_model_menu = ctk.CTkComboBox(self.anthropic_frame, cursor="hand2", values=model_fetcher.MAIN_MODELS["anthropic"], height=32, width=260)
-        self.anthropic_model_menu.set(self.config.get("anthropic_model", "claude-3-5-sonnet-latest"))
+        self.anthropic_model_menu.set(self.config.get("anthropic_model", "claude-sonnet-5"))
 
         # 4. xAI Grok
         self.xai_frame = ctk.CTkFrame(self.api_card, fg_color=THEME["bg_card_alt"], corner_radius=8)
@@ -607,7 +607,7 @@ class ClipGenApp(ctk.CTk):
 
         self.xai_model_label = ctk.CTkLabel(self.xai_frame, text="AI Model:", font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_secondary"])
         self.xai_model_menu = ctk.CTkComboBox(self.xai_frame, cursor="hand2", values=model_fetcher.MAIN_MODELS["xai"], height=32, width=260)
-        self.xai_model_menu.set(self.config.get("xai_model", "grok-2-latest"))
+        self.xai_model_menu.set(self.config.get("xai_model", "grok-4.3"))
 
         # 5. Google Gemini
         self.google_frame = ctk.CTkFrame(self.api_card, fg_color=THEME["bg_card_alt"], corner_radius=8)
@@ -640,7 +640,7 @@ class ClipGenApp(ctk.CTk):
 
         self.google_model_label = ctk.CTkLabel(self.google_frame, text="AI Model:", font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_secondary"])
         self.google_model_menu = ctk.CTkComboBox(self.google_frame, cursor="hand2", values=model_fetcher.MAIN_MODELS["google"], height=32, width=260)
-        self.google_model_menu.set(self.config.get("google_model", "gemini-2.5-flash"))
+        self.google_model_menu.set(self.config.get("google_model", "gemini-3.5-flash"))
 
         # Whisper Settings
         ctk.CTkLabel(self.api_card, text="Whisper Transcribe Model:", font=ctk.CTkFont(size=13, weight="bold"), text_color=THEME["text_primary"]).grid(row=6, column=0, padx=20, pady=(14, 4), sticky="w")

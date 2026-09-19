@@ -16,20 +16,24 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 ### 🎙️ Audio Intelligence & Local Whisper
 * **100% Free Local GPU Transcription:** Runs OpenAI's Whisper model directly on your NVIDIA GPU (`cuda` / `fp16`) or CPU fallback. Zero transcription API costs.
 * **Deterministic Disk Caching:** Transcriptions are automatically hashed and cached on disk (`%APPDATA%/jBahrsClipGenerator/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing.
-* **Audio Dynamics & Peak Loudness Mapping:** Computes RMS loudness for each audio chunk to identify scream-worthy jump scares, chaotic volume spikes, and loud laughing fits (`[LOUDNESS: 100%]`).
-* **Combat & Transient Action Detection:** Detects sharp percussive transients (gunshots, explosions, sudden hits) and tags them as `[ACTION: COMBAT]` so the AI detects action even during quiet gameplay.
+* **Local-Baseline Loudness:** Every transcript line gets `[LOUDNESS: X%]` measured against the *surrounding* background level (rolling ±30 s median), not the global maximum, so one huge scream no longer flattens the rest of the stream.
+* **Laughter / Scream Detection (no extra dependencies):** A numpy-only detector reads the raw waveform and inserts standalone `[LAUGHTER 80%]`, `[SCREAM 90%]` and `[LOUD 60%]` lines into the transcript. Laughter is found by sustained, regular 3-8 Hz amplitude pulsing that is louder than the baseline; screams by short bursts far above the baseline with a high spectral centroid. These are heuristics, not a trained classifier - the LLM treats them as hints and weighs them against the text.
+* **Combat & Transient Action Detection:** Sharp percussive transients (gunshots, explosions, hits) are tagged `[ACTION: COMBAT]`.
+* **Word-Level Timestamps:** Whisper runs with `word_timestamps`, which is what makes precise clip boundaries possible.
 * **Multi-Track OBS Downmixing:** Automatically inspects multi-track containers via `ffprobe` and downmixes all channels (Mic, Discord, Game) via FFmpeg `amix` to ensure no speech is lost.
 
 ### 🧠 Multi-Provider LLM Highlight Detection
-* **Full-Context Analysis (No Chunking):** Feeds whole multi-hour transcripts (up to 2M+ tokens) to the AI at once for complete narrative awareness and context retention.
+* **Two-Pass Windowed Analysis:** The transcript is cut into overlapping 12-minute windows (60 s overlap). Each window is analysed separately, so long streams are no longer squeezed into one request where the model loses the middle. Candidates from all windows are de-duplicated and then re-scored in one short second request, putting scores from different windows on a common scale. Short videos still go out in a single request.
+* **Predictable Clip Count:** The LLM only *nominates* candidates (score 5-10). The number of exported clips is controlled in code by **Target clips per hour** (Settings, default 12, `0` = no limit) and a minimum score (`min_clip_score`, default 6): the best non-overlapping candidates win. A 1.5-hour VOD yields *up to* about 18 clips (fewer only if there are not enough good candidates) instead of whatever the model felt like.
+* **Boundary Refinement in Code:** Clip start/end are snapped to phrase boundaries (word level inside long segments), guarantee setup before and reaction after the model-reported `peak_time`, let a laugh play out, and and keep neighbouring clips from overlapping (the exporter adds its own pre/post-roll), so clips stop starting or ending mid-sentence.
 * **Universal Model Support:** Native, direct API clients with automatic fallback:
-  * **Google Gemini:** `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash`, `gemini-3-pro` (Recommended for massive token context).
-  * **Anthropic Claude:** `claude-3-5-sonnet`, `claude-3-5-haiku`, `claude-3-7-sonnet`.
-  * **OpenAI:** `gpt-4o`, `gpt-4o-mini`, `o1`, `o3-mini`.
-  * **xAI:** `grok-2-latest`, `grok-2-mini`.
+  * **Google Gemini:** `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-2.5-flash`, `gemini-2.5-pro` (large context).
+  * **Anthropic Claude:** `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`.
+  * **OpenAI:** `gpt-5.5`, `gpt-5.4`, `gpt-4o`, `gpt-4o-mini`.
+  * **xAI:** `grok-4.3`, `grok-4.6`, `grok-4-1-fast-*`.
   * **DeepSeek & OpenRouter:** `deepseek-v4-flash`, `deepseek-v4-pro`, or any custom OpenAI-compatible endpoint.
 * **Dynamic Model Discovery:** Automatically queries provider endpoints in the background to keep the model picker updated with the latest available releases.
-* **Configurable Prompt Profiles:** Built-in fine-tuned prompts with virality scoring (1–10), comedic setup-payoff timing, and explicit `"clip it"` voice-command recognition.
+* **Configurable Prompt Profiles:** The built-in Default prompt documents the audio tags, has an explicit boundary-cutting section and a worked example, an absolute 1-10 rubric, and `"clip it"` voice-command recognition. The protected Default profile is re-synced from the codebase on every launch; custom profiles are left untouched.
 
 ### ⚡ GPU-Accelerated Video Pipeline
 * **Hardware Encoding (NVENC / AMF / CUDA):** Renders output MP4 clips using dedicated hardware encoders (`h264_nvenc`) for blazing-fast export speeds.
@@ -56,11 +60,13 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 flowchart LR
     A[Raw Local Video / Recording] --> B[FFmpeg Audio Ingestion]
     B -->|amix Multi-Track| C[16kHz PCM Buffer]
-    C --> D[Local GPU Whisper]
-    C --> E[RMS Peak & Combat Analysis]
+    C --> D[Local GPU Whisper + word timestamps]
+    C --> E[Local-baseline loudness, combat, laughter & scream events]
     D & E --> F[Annotated Transcript]
-    F --> G[LLM Highlight Extraction]
-    G -->|JSON Timestamps & Virality Scores| H[GPU FFmpeg Video Engine]
+    F --> G1[LLM: candidates per 12-min window]
+    G1 --> G2[Dedupe + global re-score]
+    G2 --> G3[Density selection + boundary refinement]
+    G3 -->|Timestamps & Virality Scores| H[GPU FFmpeg Video Engine]
     H -->|NVENC + 9:16 Crop + VR Deshake| I[Rendered MP4 Clips]
     H --> J[Thumbnails & JSON Metadata]
     I & J --> K[Clip Gallery / Discord Webhook]
@@ -132,8 +138,9 @@ uv venv .venv
 # 2. Activate virtual environment
 .venv\Scripts\activate
 
-# 3. Install dependencies with PyTorch CUDA 12.4 support
-uv pip install --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
+# 3. Install dependencies with PyTorch CUDA 12.6 support
+#    (unsafe-best-match lets uv take numpy & co. from PyPI while torch comes from the CUDA index)
+uv pip install --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
 
 # 4. Launch the application
 python main.py
@@ -171,7 +178,7 @@ This target executes:
 ### 2. Video Highlight Extraction
 1. Go to the **🎬 Clip Extractor** tab.
 2. Select local video file(s) (`.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`) using the **Browse Files** button or enter file paths.
-3. Choose the active **Prompt Profile** in Prompt Manager and **Whisper Model** (`tiny`, `base`, `small`, `medium`, `large`).
+3. Choose the active **Prompt Profile** in Prompt Manager and **Whisper Model** (`tiny`, `base`, `small`, `medium`, `large`). In Settings, tune **Target clips per hour** to control how many clips you get (more clips = lower score bar; `0` disables the limit).
 4. Click **"Process Files"** to begin analysis and export.
 
 ### 3. Clip Gallery
@@ -186,7 +193,8 @@ This target executes:
 
 Application settings and cached data are stored in `%APPDATA%/jBahrsClipGenerator/`:
 * `config.json` — Active provider, model preferences, crop dimensions, and storage paths.
-* `transcripts/` — Cached Whisper JSON transcripts indexed by video metadata hashes.
+* `transcripts/` — Cached Whisper JSON transcripts (segments, word timestamps, audio events) indexed by video metadata hashes. The cache is versioned: after an upgrade that changes the layout, videos are transcribed once more automatically.
+* `settings.clips_per_hour` (default `12`, `0` = unlimited) and `settings.min_clip_score` (default `6`) in `config.json` control how many clips are exported.
 * `logs/` — Timestamped execution and error logs.
 
 ---
@@ -195,11 +203,11 @@ Application settings and cached data are stored in `%APPDATA%/jBahrsClipGenerato
 
 | Provider | Model | Best For | Notes |
 | :--- | :--- | :--- | :--- |
-| **Google** | `gemini-2.5-flash` / `gemini-3-flash` | **All-round Best** | 1M–2M context window handles 4+ hour VODs seamlessly at high speed. |
-| **Anthropic** | `claude-3-5-sonnet` | **High Precision** | Exceptional nuanced comedy and banter comprehension. |
+| **Google** | `gemini-3.5-flash` | **All-round Best** | Large context and fast; windowed analysis keeps quality high on 4+ hour VODs. |
+| **Anthropic** | `claude-sonnet-5` | **High Precision** | Exceptional nuanced comedy and banter comprehension. |
 | **DeepSeek** | `deepseek-v4-flash` | **Budget / Value** | Cost-effective extraction via official API or OpenRouter. |
-| **OpenAI** | `gpt-4o` | **General Gaming** | Ensure your account tier supports large token requests. |
-| **xAI** | `grok-2-latest` | **Edgy / Fast Comedy** | Strong grasp of chaotic banter and sarcasm. |
+| **OpenAI** | `gpt-5.5` | **General Gaming** | Ensure your account tier supports large token requests. |
+| **xAI** | `grok-4.3` | **Edgy / Fast Comedy** | Strong grasp of chaotic banter and sarcasm. |
 
 ---
 

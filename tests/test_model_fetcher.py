@@ -164,12 +164,12 @@ def test_fetch_xai_models_empty_key():
 
 def test_fetch_xai_models_success(monkeypatch):
     mock_client = MagicMock()
-    mock_model1 = MagicMock(id="grok-2-latest")
+    mock_model1 = MagicMock(id="grok-4.3")
     mock_client.models.list.return_value = [mock_model1]
 
     monkeypatch.setattr("src.services.model_fetcher.OpenAI", lambda **kwargs: mock_client)
     models = model_fetcher.fetch_xai_models("fake_key")
-    assert models == ["grok-2-latest"]
+    assert models == ["grok-4.3"]
 
 
 def test_fetch_all_available_models(monkeypatch):

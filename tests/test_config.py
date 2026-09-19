@@ -30,11 +30,14 @@ def test_get_default_config():
     assert "Default" in config["prompts"]["profiles"]
 
     default_prompt = config["prompts"]["profiles"]["Default"]
-    assert "COMEDY, BANTER & ROASTING" in default_prompt
-    assert "EPIC GAMEPLAY, KILLSTREAKS & CLUTCHES" in default_prompt
-    assert "SMART TRIMMING" in default_prompt
-    assert "LANGUAGE REQUIREMENT FOR OUTPUT" in default_prompt
+    assert "COMEDY & BANTER" in default_prompt
+    assert "EPIC GAMEPLAY" in default_prompt
+    assert "HOW TO CUT" in default_prompt
+    assert "peak_time" in default_prompt
+    assert "LANGUAGE" in default_prompt
     assert "virality_score" in default_prompt
+    assert config["settings"]["clips_per_hour"] == 12
+    assert config["settings"]["min_clip_score"] == 6
 
 
 

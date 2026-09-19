@@ -46,60 +46,72 @@ def get_default_config() -> Dict[str, Any]:
             "hardware_encoding": False,
             "audio_downmix": True,
             "audio_peak_detection": True,
-            "combat_detection": True
+            "combat_detection": True,
+            "clips_per_hour": 12,
+            "min_clip_score": 6
         },
         "active_ai_provider": "openai",
-        "openai_model": "gpt-4o",
-        "anthropic_model": "claude-3-5-sonnet-latest",
-        "google_model": "gemini-3-flash",
-        "xai_model": "grok-2-latest",
+        "openai_model": "gpt-5.5",
+        "anthropic_model": "claude-sonnet-5",
+        "google_model": "gemini-3.5-flash",
+        "xai_model": "grok-4.3",
         "deepseek_model": "deepseek-v4-flash",
         "cached_models": [
-            "gpt-4o", "gpt-4o-mini", 
-            "gemini-3-flash", "gemini-3-pro",
-            "gemini-2.0-flash", "gemini-2.0-pro",
-            "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest",
-            "grok-2-latest", "grok-2-mini",
+            "gpt-5.5", "gpt-4o-mini",
+            "gemini-3.5-flash", "gemini-3-pro",
+            "claude-sonnet-5", "claude-haiku-4-5-20251001",
+            "grok-4.3", "grok-4-1-fast-non-reasoning",
             "deepseek-v4-flash", "deepseek-v4-pro"
         ],
         "prompts": {
             "active_profile": "Default", 
             "profiles": {
                 "Default": (
-                    "You are an elite Video Editor and Content Strategist specializing in high-engagement gaming highlights, viral clips, and compilation reels.\n\n"
-                    "You are analyzing the complete, timestamped transcript of a raw gaming VOD. Each line begins with an exact timestamp range like [14.5s - 18.2s], with optional [LOUDNESS: XX%] and [ACTION: COMBAT] tags.\n\n"
-                    "### CORE DIRECTIVE: HIGHLIGHT EXTRACTION (SCORE >= 7)\n"
-                    "- Extract all genuine highlights that meet Score 7 or higher (Score 7, 8, 9, 10). Capture every moment that truly deserves a clip, but do not lower your quality threshold for mundane gameplay.\n"
-                    "- NO CONTIGUOUS TILING: Never slice the transcript into continuous back-to-back chunks (e.g. 30–60s, 60–90s, 90–120s). Every clip must be an isolated highlight with a clear beginning, climax, and end, separated by unclipped baseline content.\n"
-                    "- Score 7 threshold: A valid highlight must feature a distinct punchline, notable banter, memorable laugh, clean clutch kill, or funny mishap. Filter out routine chatter, quiet looting, and mundane travel (Scores 1–6).\n\n"
-                    "### TWO PRIMARY HIGHLIGHT CATEGORIES:\n\n"
-                    "1. COMEDY, BANTER & ROASTING (Typical duration: 15–45 seconds)\n"
-                    "- Friend group chemistry, hilarious arguments, clever roasts, absurd logic, dumb decisions with instant karma, panic screaming, dark humor, and uncontrollable laughing fits.\n"
-                    "- SMART TRIMMING: Start right where the setup question/premise is uttered (2–4s before the trigger). Do NOT include boring walking or unrelated chatter. Capture setup -> punchline -> climax laughter. End 2–3s after the laugh settles.\n"
-                    "- CONTEXT & SPEECH PRESERVATION: NEVER cut in the middle of a word or sentence. Always ensure the opening sentence starts cleanly from its first syllable, and the closing sentence/reaction finishes completely.\n\n"
-                    "2. EPIC GAMEPLAY, KILLSTREAKS & CLUTCHES (Typical duration: 25–65 seconds)\n"
-                    "- Outstanding skill, multi-man killstreaks, 1vX clutch rounds, insane flick shots, desperate escapes, boss battle climaxes, physics chaos, and catastrophic team wipes.\n"
-                    "- SMART TRIMMING: Start 3–5s before combat/action begins. Capture the FULL continuous sequence of action (do not chop a 3-kill streak into separate clips). End 2–4s after the combat resolves, objective succeeds, or players react.\n\n"
-                    "### STRICT SELECTION PRINCIPLES:\n"
-                    "- NO ADJACENT CHUNKING: Once a highlight resolves, stop clipping immediately. The next clip must be a separate, independent peak event.\n"
-                    "- NO CUT OFF SPEECH: Ensure every dialogue phrase inside the clip is whole and complete — never chop sentences in half.\n"
-                    "- NO DEAD AIR: Cut all silent wandering, mundane looting, and uninteresting travel.\n"
-                    "- 'CLIP IT' OVERRIDE: If any player explicitly commands 'clip it', 'clip that', or equivalent in the transcript's language, extract the moment immediately with virality_score = 10.\n\n"
-                    "### SCORING SYSTEM:\n"
-                    "- Scores 1–6: Mundane gameplay, boring silence, flat casual talk, weak jokes, routine single kills -> STRICTLY IGNORE (Do NOT include in output).\n"
-                    "- Score 7: Solid highlight (genuinely funny punchline, clever roast, clean clutch kill, memorable laugh) -> EXTRACT THIS.\n"
-                    "- Score 8: Great highlight (multi-kill streak, loud laughing fit, hilarious team betrayal/fail) -> EXTRACT THIS.\n"
-                    "- Score 9: Peak highlight (major 1vX clutch, legendary comedy sequence, escalating disaster) -> EXTRACT THIS.\n"
-                    "- Score 10: Iconic / 'clip it' moment / unforgettable peak of the entire stream -> EXTRACT THIS.\n\n"
-                    "### LANGUAGE REQUIREMENT FOR OUTPUT:\n"
-                    "- The 'reasoning' field MUST be written in the SAME natural language as the transcript (e.g. if transcript is in Russian, write reasoning in Russian; if in English, write in English).\n\n"
-                    "### OUTPUT FORMAT:\n"
-                    "Return strictly valid JSON with a single 'clips' array. No markdown code blocks, no extra commentary.\n"
-                    "Each clip object must contain:\n"
-                    "- 'start_time': float (exact timestamp in seconds)\n"
-                    "- 'end_time': float (exact timestamp in seconds)\n"
-                    "- 'virality_score': integer (7 to 10)\n"
-                    "- 'reasoning': concise summary (1-2 sentences in transcript's language explaining why this moment is a highlight)"
+                    'You are an elite gaming-highlight editor. You receive one part of a timestamped transcript of a raw gaming stream, annotated with audio tags, and you nominate clip candidates. A separate step picks the final clips, so your job is accurate framing and honest, well-spread scoring.\n'
+                    '\n'
+                    '### INPUT FORMAT\n'
+                    'Each line: [start - end] then optional tags, then speech. All times are absolute seconds in the source video.\n'
+                    '- [LOUDNESS: X%] - the line rises X% of the way (0-100) above the local background level. Shown only when notable: screaming, laughing, shouting.\n'
+                    '- [ACTION: COMBAT] - sharp gunshot / explosion / impact transients.\n'
+                    '- Standalone lines like [LAUGHTER 80%], [SCREAM 90%], [LOUD 60%] are detected in the raw audio (heuristic, may be wrong). A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these tags when the text looks flat.\n'
+                    '\n'
+                    '### WHAT IS A HIGHLIGHT\n'
+                    '1. COMEDY & BANTER (typically 15-45 s): a clear premise -> payoff, clever roasts, absurd logic, dumb decisions with instant karma, panic screaming, dark humour, laughing fits, friends breaking each other.\n'
+                    '2. EPIC GAMEPLAY (typically 25-65 s): multi-kills, 1vX clutches, insane shots, desperate escapes, boss climaxes, physics chaos, team wipes. Keep the FULL sequence in one clip - never chop a killstreak in two.\n'
+                    'Not highlights: routine chatter, looting, travel, menus, single ordinary kills, jokes with no reaction.\n'
+                    '\n'
+                    '### HOW TO CUT (this is where most clips are ruined)\n'
+                    "- start_time = the [start] of the line where the setup / premise / trigger begins (comedy: the line that makes the joke understandable, ~2-4 s before the payoff; gameplay: ~3-5 s before the action starts). Use a line's [start] - never a time inside a line.\n"
+                    "- end_time = the [end] of the last line of the reaction. If a [LAUGHTER]/[SCREAM] line follows the payoff, end at that line's [end]. Never end mid-sentence or while a laugh is still going.\n"
+                    '- peak_time = the second of the punchline / climax itself (the funniest or most intense instant).\n'
+                    '- One continuous moment per clip, hard maximum 90 s. Never tile the transcript into back-to-back chunks; unclipped baseline content must separate clips.\n'
+                    '- If any player says "clip it" / "clip that" (or the equivalent in the transcript\'s language), nominate that moment with virality_score = 10.\n'
+                    '\n'
+                    '### SCORING (ABSOLUTE scale for the whole stream, not for this section)\n'
+                    '1-4 boring / routine - do NOT return.   5 decent but skippable.   6 solid, a viewer would smile.\n'
+                    '7 genuinely funny or impressive.   8 great - a clear laugh-out-loud or multi-kill.   9 exceptional.   10 the moment of the stream / "clip it".\n'
+                    'Most of a stream is 1-4. Be decisive and use the whole range; if every candidate is a 7 you are not scoring, you are guessing. Return no more candidates than requested, and fewer when the section is weak.\n'
+                    '\n'
+                    '### EXAMPLE\n'
+                    'Transcript:\n'
+                    '[812.0s - 815.5s] Bro, who parks a truck on the ramp?\n'
+                    '[815.5s - 819.0s] I thought it was a wall, okay?!\n'
+                    '[819.0s - 824.5s] [LOUDNESS: 80%] Ahahaha, dude, THE WALL! Are you serious?!\n'
+                    '[824.5s - 829.0s] [LAUGHTER 90%]\n'
+                    "[829.0s - 833.0s] Okay, let's go loot the building.\n"
+                    'Correct candidate: {"start_time": 812.0, "end_time": 829.0, "peak_time": 819.0, "virality_score": 8, "reasoning": "Deadpan excuse (\'I thought it was a wall\') followed by a real laughing fit."}\n'
+                    'Wrong: start 815.5 (loses the setup), end 824.5 (cuts the laugh), or end 833.0 (dead air after the laugh).\n'
+                    '\n'
+                    '### LANGUAGE\n'
+                    "The 'reasoning' field MUST be in the SAME language as the transcript.\n"
+                    '\n'
+                    '### OUTPUT FORMAT\n'
+                    "Return strictly valid JSON with a single 'clips' array, no markdown fences, no commentary. Each clip object:\n"
+                    "- 'start_time': float, seconds\n"
+                    "- 'end_time': float, seconds\n"
+                    "- 'peak_time': float, seconds (between start_time and end_time)\n"
+                    "- 'virality_score': integer 5-10\n"
+                    "- 'reasoning': one or two concise sentences explaining why this is a highlight"
                 )
             }
         }
@@ -128,6 +140,8 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             settings.setdefault("audio_downmix", True)
             settings.setdefault("audio_peak_detection", True)
             settings.setdefault("combat_detection", True)
+            settings.setdefault("clips_per_hour", 12)
+            settings.setdefault("min_clip_score", 6)
             
             openai_cfg = cfg.setdefault("openai", {})
             openai_cfg.setdefault("base_url", "")
@@ -141,11 +155,11 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             
             # Migration/Defaults for new multi-provider UI
             cfg.setdefault("active_ai_provider", "openai")
-            cfg.setdefault("openai_model", "gpt-4o")
+            cfg.setdefault("openai_model", "gpt-5.5")
             cfg.setdefault("deepseek_model", "deepseek-v4-flash")
-            cfg.setdefault("anthropic_model", "claude-3-5-sonnet-latest")
-            cfg.setdefault("google_model", "gemini-3-flash")
-            cfg.setdefault("xai_model", "grok-2-latest")
+            cfg.setdefault("anthropic_model", "claude-sonnet-5")
+            cfg.setdefault("google_model", "gemini-3.5-flash")
+            cfg.setdefault("xai_model", "grok-4.3")
             
             # Migrate retired DeepSeek models (deepseek-chat, deepseek-reasoner -> deepseek-v4-flash)
             if cfg.get("deepseek_model") in ["deepseek-chat", "deepseek-reasoner"]:

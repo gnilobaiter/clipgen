@@ -1145,7 +1145,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "OpenAI & Compatible Endpoints", "openai", active_prov,
             self.config.get("openai", {}).get("api_key", ""),
             model_fetcher.MAIN_MODELS["openai"],
-            self.config.get("openai_model", "gpt-4o"),
+            self.config.get("openai_model", "gpt-5.5"),
             self.config.get("openai", {}).get("base_url", ""),
             self._test_openai_key,
             is_openai=True
@@ -1168,7 +1168,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "Anthropic Claude Engine", "anthropic", active_prov,
             self.config.get("anthropic", {}).get("api_key", ""),
             model_fetcher.MAIN_MODELS["anthropic"],
-            self.config.get("anthropic_model", "claude-3-5-sonnet-latest"),
+            self.config.get("anthropic_model", "claude-sonnet-5"),
             "",
             self._test_anthropic_key
         )
@@ -1179,7 +1179,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "xAI Grok Intelligence", "xai", active_prov,
             self.config.get("xai", {}).get("api_key", ""),
             model_fetcher.MAIN_MODELS["xai"],
-            self.config.get("xai_model", "grok-2-latest"),
+            self.config.get("xai_model", "grok-4.3"),
             "",
             self._test_xai_key
         )
@@ -1190,7 +1190,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "Google Gemini (2M Long Context)", "google", active_prov,
             self.config.get("google", {}).get("api_key", ""),
             model_fetcher.MAIN_MODELS["google"],
-            self.config.get("google_model", "gemini-3-flash"),
+            self.config.get("google_model", "gemini-3.5-flash"),
             "",
             self._test_google_key
         )
@@ -1254,6 +1254,14 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         self.combat_checkbox = QtWidgets.QCheckBox("Gunfight & Combat Transient Spikes Detection", whisper_card)
         self.combat_checkbox.setChecked(self.config.get("settings", {}).get("combat_detection", True))
         whisper_layout.addWidget(self.combat_checkbox, 4, 0, 1, 2)
+
+        clips_label = QtWidgets.QLabel("Target clips per hour of video (0 = no limit):", whisper_card)
+        clips_label.setProperty("class", "field-label")
+        self.clips_per_hour_spin = QtWidgets.QSpinBox(whisper_card)
+        self.clips_per_hour_spin.setRange(0, 60)
+        self.clips_per_hour_spin.setValue(int(self.config.get("settings", {}).get("clips_per_hour", 12)))
+        whisper_layout.addWidget(clips_label, 5, 0)
+        whisper_layout.addWidget(self.clips_per_hour_spin, 5, 1)
 
         layout.addWidget(whisper_card)
 
@@ -1740,6 +1748,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         settings["audio_downmix"] = self.downmix_checkbox.isChecked()
         settings["audio_peak_detection"] = self.peak_checkbox.isChecked()
         settings["combat_detection"] = self.combat_checkbox.isChecked()
+        settings["clips_per_hour"] = self.clips_per_hour_spin.value()
         settings["hardware_encoding"] = self.hw_encode_checkbox.isChecked()
         settings["vr_stabilization"] = self.vr_checkbox.isChecked()
         settings["vertical_export"] = self.vertical_checkbox.isChecked()

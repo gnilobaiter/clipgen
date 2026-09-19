@@ -12,6 +12,7 @@ import numpy as np
 from openai import OpenAI
 import whisper
 
+from src.core import audio_events, highlights
 from src.core import config as config_manager
 from src.utils.hardware import get_hardware_status, log_hardware_info
 from src.utils.paths import get_app_data_path, get_ffmpeg_path, get_ffprobe_path, inject_bin_to_path
@@ -59,66 +60,35 @@ class WhisperProgressStream(io.StringIO):
         return super().write(s)
 
 def analyze_audio_peaks(audio_array: np.ndarray, segments: List[Dict[str, Any]], sample_rate: int = 16000, peak_detection: bool = True, combat_detection: bool = True) -> List[Dict[str, Any]]:
-    """Calculates RMS loudness and detects combat transients for each Whisper segment."""
+    """Annotates each Whisper segment with `loudness` (0-100, relative to the LOCAL background level,
+    not the global maximum) and `is_combat` (sharp percussive transients)."""
+    _rms, level_db, baseline_db = audio_events.compute_level_profile(audio_array) if peak_detection else (None, [], [])
     enhanced_segments = []
-    
-    for seg in segments:
-        start_idx = int(seg['start'] * sample_rate)
-        end_idx = int(seg['end'] * sample_rate)
-        
-        # Ensure indices stay within array bounds
-        start_idx = max(0, min(start_idx, len(audio_array) - 1))
-        end_idx = max(start_idx + 1, min(end_idx, len(audio_array)))
-        
-        chunk = audio_array[start_idx:end_idx]
-        
-        rms = 0.0
-        is_combat = False
-        
-        if len(chunk) > 0:
-            if peak_detection:
-                rms = float(np.sqrt(np.mean(chunk**2)))
-            
-            if combat_detection and len(chunk) >= 512:
-                # Transient / Combat detection
-                hop_size = 256
-                window_size = 512
-                sub_chunks = [chunk[i:i+window_size] for i in range(0, len(chunk) - window_size, hop_size)]
-                if sub_chunks:
-                    sub_rms = np.array([np.sqrt(np.mean(sc**2)) for sc in sub_chunks])
-                    mean_sub = np.mean(sub_rms)
-                    max_sub = np.max(sub_rms)
-                    # A sharp spike (gunshot/hit) typically exceeds 3.5x the local segment average
-                    if mean_sub > 0.01 and (max_sub / (mean_sub + 1e-5)) > 3.5:
-                        is_combat = True
 
+    for seg in segments:
         seg_copy = dict(seg)
-        seg_copy['rms'] = rms
+        start_idx = max(0, min(int(seg['start'] * sample_rate), len(audio_array) - 1))
+        end_idx = max(start_idx + 1, min(int(seg['end'] * sample_rate), len(audio_array)))
+        chunk = audio_array[start_idx:end_idx]
+
+        if peak_detection:
+            seg_copy['loudness'] = audio_events.segment_loudness(seg['start'], seg['end'], level_db, baseline_db)
+
+        is_combat = False
+        if combat_detection and len(chunk) >= 512:
+            hop_size = 256
+            window_size = 512
+            sub_chunks = [chunk[i:i + window_size] for i in range(0, len(chunk) - window_size, hop_size)]
+            if sub_chunks:
+                sub_rms = np.array([np.sqrt(np.mean(sc ** 2)) for sc in sub_chunks])
+                mean_sub = np.mean(sub_rms)
+                max_sub = np.max(sub_rms)
+                # A sharp spike (gunshot/hit) typically exceeds 3.5x the local segment average
+                if mean_sub > 0.01 and (max_sub / (mean_sub + 1e-5)) > 3.5:
+                    is_combat = True
         seg_copy['is_combat'] = is_combat
         enhanced_segments.append(seg_copy)
-        
-    if not peak_detection and not combat_detection:
-        return enhanced_segments
 
-    # Normalize RMS to a 0-100 scale across the entire video
-    all_rms = [s['rms'] for s in enhanced_segments if 'rms' in s]
-    max_overall_rms = max(all_rms) if all_rms else 1.0
-    if max_overall_rms == 0: max_overall_rms = 1.0
-    
-    for seg in enhanced_segments:
-        raw_rms = seg.get('rms', 0.0)
-        loudness_score = int((raw_rms / max_overall_rms) * 100)
-        
-        tags = []
-        if peak_detection:
-            tags.append(f"[LOUDNESS: {loudness_score}%]")
-        if combat_detection and seg.get('is_combat', False):
-            tags.append("[ACTION: COMBAT]")
-            
-        tag_str = " ".join(tags)
-        if tag_str:
-            seg['text'] = f"{tag_str} {seg['text']}"
-            
     return enhanced_segments
 
 def sanitize_filename(name: str) -> str:
@@ -447,6 +417,8 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             end = float(c.get("end_time", 0))
             score = int(c.get("virality_score", 7))
             reasoning = str(c.get("reasoning", "")).strip()
+            peak_raw = c.get("peak_time")
+            peak = round(float(peak_raw), 2) if peak_raw is not None else None
         except (ValueError, TypeError):
             continue
 
@@ -455,12 +427,15 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if (end - start) < 2.0:
             continue
 
-        valid_clips.append({
+        clip = {
             "start_time": round(start, 2),
             "end_time": round(end, 2),
             "virality_score": score,
             "reasoning": reasoning
-        })
+        }
+        if peak is not None:
+            clip["peak_time"] = peak
+        valid_clips.append(clip)
 
     valid_clips.sort(key=lambda x: x["start_time"])
 
@@ -475,6 +450,8 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             combined_duration = max(prev["end_time"], clip["end_time"]) - prev["start_time"]
             if combined_duration <= 85.0:
                 prev["end_time"] = max(prev["end_time"], clip["end_time"])
+                if clip["virality_score"] > prev["virality_score"] and "peak_time" in clip:
+                    prev["peak_time"] = clip["peak_time"]
                 prev["virality_score"] = max(prev["virality_score"], clip["virality_score"])
                 if clip["reasoning"] and clip["reasoning"] not in prev["reasoning"]:
                     prev["reasoning"] = f"{prev['reasoning']} | {clip['reasoning']}"
@@ -484,41 +461,40 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return merged
 
-def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
-    """Robustly parses a JSON string containing clips."""
+def _load_json_payload(raw_text: Any) -> Optional[Any]:
+    """Decodes a JSON object/list from a raw LLM answer (tolerates code fences and surrounding prose)."""
     if not raw_text or not isinstance(raw_text, str):
         return None
-    
     text = raw_text.strip()
-    if not text:
-        return None
-
-    # Strip markdown code fences if present
-    if text.startswith("```json"):
-        text = text.partition("```json")[2].partition("```")[0].strip()
-    elif text.startswith("```"):
-        text = text.partition("```")[2].partition("```")[0].strip()
-    elif "```json" in text:
-        match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).partition("```")[0].strip()
+    elif "```" in text:
+        match = re.search(r"```(?:json)?\s*([\[{][\s\S]*?[\]}])\s*```", text)
         if match:
             text = match.group(1).strip()
-
     try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "clips" in data:
-            return _clean_and_merge_clips(data.get("clips", []))
-        elif isinstance(data, list):
-            return _clean_and_merge_clips(data)
+        return json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"(\{[\s\S]*\})", text)
         if match:
             try:
-                data = json.loads(match.group(1))
-                if isinstance(data, dict) and "clips" in data:
-                    return _clean_and_merge_clips(data.get("clips", []))
-            except Exception:
-                pass
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                return None
     return None
+
+def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
+    """Robustly parses a JSON string containing clips."""
+    data = _load_json_payload(raw_text)
+    if isinstance(data, dict) and "clips" in data:
+        return _clean_and_merge_clips(data.get("clips", []))
+    if isinstance(data, list):
+        return _clean_and_merge_clips(data)
+    return None
+
+# Bump when the cached segment layout changes (v2: word timestamps, local-baseline loudness, audio events)
+TRANSCRIPT_CACHE_VERSION = 2
+
 
 def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool) -> str:
     """Computes a deterministic hash and cache file path for audio transcriptions."""
@@ -528,7 +504,7 @@ def _get_transcription_cache_path(file_path: str, whisper_model: str, target_lan
     except Exception:
         mtime, size = 0, 0
     
-    cache_key = f"{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}"
+    cache_key = f"v{TRANSCRIPT_CACHE_VERSION}_{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}"
     file_hash = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
     
     cache_dir = os.path.join(get_app_data_path(), "transcripts")
@@ -560,6 +536,35 @@ def _save_cached_segments(cache_file: str, segments: List[Dict[str, Any]], logge
     except Exception as e:
         if logger:
             logger(f"⚠️ Failed to cache transcription: {e}")
+
+def _slim_segments(raw_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keeps only what the pipeline needs (Whisper's token arrays would bloat the disk cache)."""
+    slim = []
+    for seg in raw_segments:
+        entry: Dict[str, Any] = {"start": float(seg["start"]), "end": float(seg["end"]), "text": str(seg.get("text", ""))}
+        words = [{"word": w.get("word", ""), "start": float(w["start"]), "end": float(w["end"])}
+                 for w in seg.get("words", []) or [] if "start" in w and "end" in w]
+        if words:
+            entry["words"] = words
+        slim.append(entry)
+    return slim
+
+
+def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
+    """Laughter / scream / loud-burst detection as timeline entries; never fails the whole transcription."""
+    try:
+        detected = audio_events.detect_audio_events(audio_array)
+    except Exception as e:
+        if logger: logger(f"⚠️ Audio event detection skipped: {e}")
+        return []
+    if logger:
+        counts: Dict[str, int] = {}
+        for ev in detected:
+            counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+        summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "none"
+        logger(f"🔊 Audio events detected: {summary}")
+    return [{"start": ev["start"], "end": ev["end"], "text": "", "event": ev["type"], "strength": ev["strength"]} for ev in detected]
+
 
 LANGUAGE_MAP = {
     "Auto-Detect": None,
@@ -638,6 +643,8 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
                 "temperature": (0.0, 0.2, 0.4),
                 "fp16": fp16_enabled,
                 "verbose": True,
+                "word_timestamps": True,
+                "hallucination_silence_threshold": 2.0,
                 "initial_prompt": "Gameplay livestream recording with conversational banter, laughter, discord chat, and gaming terms."
             }
             if target_language is not None:
@@ -645,15 +652,17 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
 
             result = model.transcribe(audio_array, **transcribe_kwargs)
             
-        raw_segments = result.get("segments", [])
-        
+        raw_segments = _slim_segments(result.get("segments", []))
+
+        segments = raw_segments
         if audio_peak_detection or combat_detection:
             segments = analyze_audio_peaks(audio_array, raw_segments, peak_detection=audio_peak_detection, combat_detection=combat_detection)
-            if logger: logger("✅ Transcription complete! Audio patterns analyzed.")
-        else:
-            segments = raw_segments
-            if logger: logger("✅ Transcription complete!")
-            
+        if audio_peak_detection:
+            events = _detect_events_safe(audio_array, logger)
+            segments = sorted(segments + events, key=lambda e: (e["start"], 0 if e.get("event") else 1))
+        if logger:
+            logger("✅ Transcription complete! Audio patterns analyzed." if (audio_peak_detection or combat_detection) else "✅ Transcription complete!")
+
         if segments:
             _save_cached_segments(cache_file, segments, logger)
         return segments
@@ -662,195 +671,235 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
         if logger: logger(f"❌ Transcription error: {e}")
         return None
 
-def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, Any], chat_model: str, prompt_text: str, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
-    openai_key = config.get("openai", {}).get("api_key", "")
-    openai_base_url = config.get("openai", {}).get("base_url", "")
-    deepseek_key = config.get("deepseek", {}).get("api_key", "")
-    deepseek_base_url = config.get("deepseek", {}).get("base_url", "https://api.deepseek.com")
-    google_key = config.get("google", {}).get("api_key", "")
-    anthropic_key = config.get("anthropic", {}).get("api_key", "")
-    xai_key = config.get("xai", {}).get("api_key", "")
-    active_provider = config.get("active_ai_provider", "openai")
+ANTHROPIC_MAX_OUTPUT_TOKENS = 8192  # per window (a handful of clips); stays under the SDK's non-streaming limit
+LLM_ATTEMPTS = 3
+MAX_CONSECUTIVE_WINDOW_FAILURES = 2
 
-    is_gemini_model = (chat_model.startswith("gemini") or "gemini" in chat_model) and "openrouter" not in chat_model and not openai_base_url
-    is_anthropic_model = chat_model.startswith("claude") and "openrouter" not in chat_model and not openai_base_url
-    is_openrouter = "openrouter" in chat_model or (openai_base_url != "" and "deepseek" not in openai_base_url and "x.ai" not in openai_base_url)
-    is_grok_model = chat_model.startswith("grok") or active_provider == "xai"
-    is_deepseek_model = "deepseek" in chat_model.lower() or active_provider == "deepseek" or "deepseek" in (openai_base_url or "").lower()
+WINDOW_PROMPT = (
+    "This is part {index} of {total} of a {minutes:.0f}-minute gaming stream transcript, covering {w_start:.0f}s to {w_end:.0f}s. "
+    "All timestamps are absolute seconds from the start of the video.\n"
+    "{overlap_note}"
+    "Line format: [start - end] optional audio tags, then speech. [LOUDNESS: X%] = how far the line rises above the local background level "
+    "(shown only when notable); [ACTION: COMBAT] = sharp gunshot/explosion transients; standalone lines such as [LAUGHTER 80%], [SCREAM 90%] or [LOUD 60%] "
+    "were detected in the raw audio (heuristic). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
+    "Nominate up to {want} candidate highlights from this section (fewer if it is mostly boring - never pad with weak moments). "
+    "Rate each one on an ABSOLUTE 1-10 scale relative to the whole stream and only return candidates scoring 5 or higher. "
+    "Return strictly valid JSON with a 'clips' array.\n\n"
+    "{transcript}"
+)
 
-    if is_grok_model:
-        openai_key = xai_key
-        openai_base_url = "https://api.x.ai/v1"
-    elif is_deepseek_model:
-        openai_key = deepseek_key or openai_key
-        openai_base_url = deepseek_base_url or "https://api.deepseek.com"
+RERANK_PROMPT = (
+    "Below are {count} candidate highlights nominated independently from different sections of the same {minutes:.0f}-minute gaming stream. "
+    "Because each section was scored in isolation, the scores are not comparable. Re-score every candidate on ONE absolute 1-10 scale "
+    "(10 = the best moment of the whole stream, 5 = skippable); be decisive and spread the scores out. "
+    "Return strictly valid JSON: {{\"scores\": [{{\"id\": <int>, \"score\": <int 1-10>}}, ...]}} covering every id.\n\n{items}"
+)
 
-    all_clips = []
-    
-    full_transcript = "".join(
-        f"[{seg['start']:.1f}s - {seg['end']:.1f}s] {seg['text'].strip()}\n"
-        for seg in segments
-    )
 
-    word_count = full_transcript.count(' ') + 1 if full_transcript.strip() else 0
-    estimated_tokens = int(word_count * 1.3)
-    if logger:
-        logger(f"📊 Extracted approx {estimated_tokens:,} tokens ({word_count:,} words) for the AI model's context window.")
+RERANK_SYSTEM = (
+    "You are a meticulous editor calibrating highlight scores for a gaming stream. "
+    "You never nominate new clips and never change timestamps; you only re-score the numbered candidates you are given. "
+    "Answer with strictly valid JSON exactly in the format requested by the user, and nothing else."
+)
 
-    if is_gemini_model and not is_openrouter:
+
+class _LLMRoute:
+    """Which SDK / endpoint a chat model is routed to (resolved once per video)."""
+
+    def __init__(self, config: Dict[str, Any], chat_model: str):
+        openai_cfg = config.get("openai", {})
+        self.chat_model = chat_model
+        self.openai_key = openai_cfg.get("api_key", "")
+        self.openai_base_url = openai_cfg.get("base_url", "") or ""
+        self.google_key = config.get("google", {}).get("api_key", "")
+        self.anthropic_key = config.get("anthropic", {}).get("api_key", "")
+        active_provider = config.get("active_ai_provider", "openai")
+
+        has_custom_url = bool(self.openai_base_url)
+        self.is_openrouter = "openrouter" in chat_model or (has_custom_url and "deepseek" not in self.openai_base_url and "x.ai" not in self.openai_base_url)
+        self.is_gemini = "gemini" in chat_model and "openrouter" not in chat_model and not has_custom_url
+        self.is_anthropic = chat_model.startswith("claude") and "openrouter" not in chat_model and not has_custom_url
+        self.is_grok = chat_model.startswith("grok") or active_provider == "xai"
+        self.is_deepseek = "deepseek" in chat_model.lower() or active_provider == "deepseek" or "deepseek" in self.openai_base_url.lower()
+
+        if self.is_grok:
+            self.openai_key = config.get("xai", {}).get("api_key", "")
+            self.openai_base_url = "https://api.x.ai/v1"
+        elif self.is_deepseek:
+            self.openai_key = config.get("deepseek", {}).get("api_key", "") or self.openai_key
+            self.openai_base_url = config.get("deepseek", {}).get("base_url", "") or "https://api.deepseek.com"
+
+    @property
+    def engine_name(self) -> str:
+        if self.is_gemini and not self.is_openrouter: return "Gemini"
+        if self.is_anthropic: return "Claude"
+        if self.is_openrouter: return "Custom Base URL"
+        if self.is_deepseek: return "DeepSeek"
+        if self.is_grok: return "Grok"
+        return "OpenAI"
+
+
+def _complete_text(route: _LLMRoute, system_prompt: str, user_prompt: str, extra_body_enabled: List[bool]) -> Optional[str]:
+    """One raw chat completion. Raises on API errors; returns None for an empty answer."""
+    if route.is_gemini and not route.is_openrouter:
         if not HAS_GEMINI:
-            if logger: logger("❌ Error: google-genai module missing.")
-            return []
-            
-        if logger: logger(f"🌌 Routing to native Gemini Engine ({chat_model}) with {len(segments)} segments...")
-
-        client = genai.Client(api_key=google_key)
-        config_kwargs: Dict[str, Any] = {}
+            raise RuntimeError("google-genai module missing.")
+        client = genai.Client(api_key=route.google_key)
+        kwargs: Dict[str, Any] = {}
         if genai_types:
-            config_kwargs["config"] = genai_types.GenerateContentConfig(
-                system_instruction=prompt_text,
-                response_mime_type="application/json"
-            )
-        user_prompt = f"Analyze this entire gaming transcript from start to finish. Scan all timestamps chronologically and extract EVERY memorable highlight (Score >= 7: funny banter, roasts, screams, clutches, team fails, laughing fits) across the entire video. Return strictly valid JSON with a 'clips' array.\n\n{full_transcript}"
-        for attempt in range(1, 4):
-            try:
-                response = client.models.generate_content(
-                    model=chat_model,
-                    contents=user_prompt,
-                    **config_kwargs
-                )
-                raw_text = getattr(response, "text", "")
-                if not raw_text or not raw_text.strip():
-                    if logger: logger(f"⚠️ Gemini returned empty response (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-                    continue
+            kwargs["config"] = genai_types.GenerateContentConfig(system_instruction=system_prompt, response_mime_type="application/json")
+        response = client.models.generate_content(model=route.chat_model, contents=user_prompt, **kwargs)
+        return getattr(response, "text", "") or None
 
-                found_clips = _parse_json_clips(raw_text)
-                if found_clips is not None:
-                    if found_clips:
-                        if logger: logger(f"🎯 Gemini found {len(found_clips)} clip(s) in the VOD!")
-                        all_clips.extend(found_clips)
-                    else:
-                        if logger: logger("🤷‍♂️ Gemini finished but didn't find any clips.")
-                    break
-                else:
-                    if logger: logger(f"⚠️ Gemini response was not valid JSON (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-            except Exception as e:
-                if attempt == 3:
-                    if logger: logger(f"❌ Gemini API Error: {e}")
-                else:
-                    if logger: logger(f"⚠️ Gemini API Error (Attempt {attempt}/3): {e}. Retrying...")
-                    time.sleep(1.5 * attempt)
-
-    elif is_anthropic_model:
+    if route.is_anthropic:
         if not HAS_ANTHROPIC:
-            if logger: logger("❌ Error: anthropic python module missing.")
+            raise RuntimeError("anthropic python module missing.")
+        client = anthropic.Anthropic(api_key=route.anthropic_key)
+        response = client.messages.create(
+            model=route.chat_model,
+            max_tokens=ANTHROPIC_MAX_OUTPUT_TOKENS,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        if response and response.content:
+            return "".join(getattr(block, "text", "") for block in response.content) or None
+        return None
+
+    client_args = {"api_key": route.openai_key}
+    if route.openai_base_url:
+        client_args["base_url"] = route.openai_base_url
+    client = OpenAI(**client_args)
+    create_kwargs: Dict[str, Any] = {
+        "model": route.chat_model,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+    }
+    # DeepSeek V4 has thinking mode enabled by default; disable it for structured JSON output
+    if route.is_deepseek and extra_body_enabled[0]:
+        create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    try:
+        response = client.chat.completions.create(**create_kwargs)
+    except Exception as e:
+        # extra_body rejected by an incompatible proxy: drop it for all following requests
+        if "extra_body" in create_kwargs and "thinking" in str(e).lower():
+            extra_body_enabled[0] = False
+        raise
+    if response and response.choices and response.choices[0].message:
+        return response.choices[0].message.content or None
+    return None
+
+
+def _request_json(route: _LLMRoute, system_prompt: str, user_prompt: str, parser: Callable[[Any], Optional[Any]],
+                  logger: Optional[Callable[[str], None]], label: str, extra_body_enabled: List[bool]) -> Optional[Any]:
+    """Runs a completion with retries until `parser` accepts the answer. Returns the parsed value or None."""
+    for attempt in range(1, LLM_ATTEMPTS + 1):
+        try:
+            raw = _complete_text(route, system_prompt, user_prompt, extra_body_enabled)
+            if not raw or not raw.strip():
+                if logger: logger(f"⚠️ {route.engine_name} returned an empty response for {label} (Attempt {attempt}/{LLM_ATTEMPTS}). Retrying...")
+            else:
+                parsed = parser(raw)
+                if parsed is not None:
+                    return parsed
+                if logger: logger(f"⚠️ {route.engine_name} response for {label} was not valid JSON (Attempt {attempt}/{LLM_ATTEMPTS}). Retrying...")
+        except Exception as e:
+            if attempt == LLM_ATTEMPTS:
+                if logger: logger(f"❌ {route.engine_name} API Error ({label}): {e}")
+                return None
+            if logger: logger(f"⚠️ {route.engine_name} API Error ({label}, Attempt {attempt}/{LLM_ATTEMPTS}): {e}. Retrying...")
+        if attempt < LLM_ATTEMPTS:
+            time.sleep(1.5 * attempt)
+    return None
+
+
+def _parse_json_scores(raw_text: Any) -> Optional[Dict[int, int]]:
+    data = _load_json_payload(raw_text)
+    items = data.get("scores") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    scores: Dict[int, int] = {}
+    for item in items:
+        try:
+            scores[int(item["id"])] = max(1, min(10, int(item["score"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return scores or None
+
+
+def _excerpt(segments: List[Dict[str, Any]], start: float, end: float, limit: int = 320) -> str:
+    text = " ".join(str(s.get("text", "")).strip() for s in segments if not s.get("event") and s["end"] > start and s["start"] < end)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _rerank_candidates(route: _LLMRoute, candidates: List[Dict[str, Any]], segments: List[Dict[str, Any]], duration: float,
+                       logger: Optional[Callable[[str], None]], extra_body_enabled: List[bool]) -> List[Dict[str, Any]]:
+    """Pass 2: one short request that puts scores from independently-scored windows on a common scale."""
+    items = "\n".join(
+        f"id={i} [{c['start_time']:.0f}s-{c['end_time']:.0f}s] section_score={c['virality_score']} why: {c['reasoning']} | transcript: {_excerpt(segments, c['start_time'], c['end_time'])}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = RERANK_PROMPT.format(count=len(candidates), minutes=duration / 60.0, items=items)
+    scores = _request_json(route, RERANK_SYSTEM, prompt, _parse_json_scores, logger, "re-ranking", extra_body_enabled)
+    if not scores:
+        if logger: logger("⚠️ Re-ranking failed - keeping per-section scores.")
+        return candidates
+    reranked = []
+    for i, cand in enumerate(candidates):
+        updated = dict(cand)
+        updated["virality_score"] = scores.get(i, cand["virality_score"])
+        reranked.append(updated)
+    return reranked
+
+
+def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, Any], chat_model: str, prompt_text: str, logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
+    """Pass 1: nominate candidates per overlapping transcript window. Pass 2: dedupe + global re-score.
+    Returns candidates only - density selection and boundary refinement happen in process_video."""
+    route = _LLMRoute(config, chat_model)
+    extra_body_enabled = [True]
+    clips_per_hour = float(config.get("settings", {}).get("clips_per_hour", highlights.DEFAULT_CLIPS_PER_HOUR))
+
+    windows = highlights.build_windows(segments)
+    if not windows:
+        return []
+    duration = max(w["end"] for w in windows)
+
+    word_count = sum(len(str(s.get("text", "")).split()) for s in segments)
+    if logger:
+        logger(f"📊 Extracted approx {int(word_count * 1.3):,} tokens ({word_count:,} words) in {len(windows)} window(s) for the AI model.")
+        logger(f"🤖 Routing to {route.engine_name} Engine ({chat_model}) with {len(segments)} segments...")
+
+    candidates: List[Dict[str, Any]] = []
+    consecutive_failures = 0
+    for idx, window in enumerate(windows, start=1):
+        if is_cancelled and is_cancelled():
             return []
-            
-        if logger: logger(f"🌌 Routing to native Anthropic Engine ({chat_model}) with {len(segments)} segments...")
+        transcript = "".join(highlights.format_entry(e) for e in window["lines"])
+        overlap_note = ""
+        if len(windows) > 1:
+            overlap_note = (f"Only nominate moments whose peak lies inside this section; the first and last {highlights.WINDOW_OVERLAP:.0f}s overlap the "
+                            "neighbouring sections and are given for context. Do not cut a moment short just because the section ends - use its real end.\n")
+        user_prompt = WINDOW_PROMPT.format(
+            index=idx, total=len(windows), minutes=duration / 60.0, w_start=window["start"], w_end=window["end"],
+            overlap_note=overlap_note, want=highlights.requested_candidates(window["end"] - window["start"], clips_per_hour),
+            transcript=transcript,
+        )
+        found = _request_json(route, prompt_text, user_prompt, _parse_json_clips, logger, f"window {idx}/{len(windows)}", extra_body_enabled)
+        consecutive_failures = consecutive_failures + 1 if found is None else 0
+        if found:
+            if logger: logger(f"🎯 Window {idx}/{len(windows)}: {len(found)} candidate(s).")
+            candidates.extend(found)
+        elif found is not None and logger:
+            logger(f"🤷‍♂️ Window {idx}/{len(windows)}: no candidates.")
+        if consecutive_failures >= MAX_CONSECUTIVE_WINDOW_FAILURES:
+            if logger: logger(f"❌ {consecutive_failures} windows failed in a row - stopping (check your API key, model name and connection).")
+            break
 
-        client = anthropic.Anthropic(api_key=anthropic_key)
-        
-        user_prompt = f"Analyze this entire gaming transcript from start to finish. Scan all timestamps chronologically and extract EVERY memorable highlight (Score >= 7: funny banter, roasts, screams, clutches, team fails, laughing fits) across the entire video. Return strictly valid JSON with a 'clips' array.\n\n{full_transcript}"
-        for attempt in range(1, 4):
-            try:
-                response = client.messages.create(
-                    model=chat_model,
-                    max_tokens=4000,
-                    system=prompt_text,
-                    messages=[
-                        {"role": "user", "content": user_prompt}
-                    ]
-                )
-                
-                raw_content = ""
-                if response and response.content and len(response.content) > 0:
-                    raw_content = response.content[0].text
-                
-                if not raw_content or not raw_content.strip():
-                    if logger: logger(f"⚠️ Claude returned empty response (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-                    continue
+    candidates = highlights.dedupe_candidates(candidates)
+    if len(windows) > 1 and len(candidates) > 3 and not (is_cancelled and is_cancelled()):
+        if logger: logger(f"⚖️ Re-ranking {len(candidates)} candidates on a common scale...")
+        candidates = _rerank_candidates(route, candidates, segments, duration, logger, extra_body_enabled)
+    return candidates
 
-                found_clips = _parse_json_clips(raw_content)
-                if found_clips is not None:
-                    if found_clips:
-                        if logger: logger(f"🎯 Claude found {len(found_clips)} clip(s) in the VOD!")
-                        all_clips.extend(found_clips)
-                    else:
-                        if logger: logger("🤷‍♂️ Claude finished but didn't find any clips.")
-                    break
-                else:
-                    if logger: logger(f"⚠️ Claude response was not valid JSON (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-            except Exception as e:
-                if attempt == 3:
-                    if logger: logger(f"❌ Anthropic API Error: {e}")
-                else:
-                    if logger: logger(f"⚠️ Anthropic API Error (Attempt {attempt}/3): {e}. Retrying...")
-                    time.sleep(1.5 * attempt)
-
-    else:
-        if logger: 
-            if is_openrouter: logger(f"🤖 Routing via Custom Base URL ({chat_model}) with {len(segments)} segments...")
-            elif is_deepseek_model: logger(f"🤖 Routing to DeepSeek Engine ({chat_model}) with {len(segments)} segments...")
-            else: logger(f"🤖 Routing to OpenAI Engine ({chat_model}) with {len(segments)} segments...")
-            
-        client_args = {"api_key": openai_key}
-        if openai_base_url:
-            client_args["base_url"] = openai_base_url
-            
-        client = OpenAI(**client_args)
-        user_prompt = f"Analyze this entire gaming transcript from start to finish. Scan all timestamps chronologically and extract EVERY memorable highlight (Score >= 7: funny banter, roasts, screams, clutches, team fails, laughing fits) across the entire video. Return strictly valid JSON with a 'clips' array.\n\n{full_transcript}"
-
-        create_kwargs: Dict[str, Any] = {
-            "model": chat_model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": prompt_text},
-                {"role": "user", "content": user_prompt}
-            ]
-        }
-
-        # DeepSeek V4 has thinking mode enabled by default; explicitly disable it for structured JSON clip generation
-        if is_deepseek_model:
-            create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-
-        for attempt in range(1, 4):
-            try:
-                response = client.chat.completions.create(**create_kwargs)
-                content = None
-                if response and response.choices and len(response.choices) > 0 and response.choices[0].message:
-                    content = response.choices[0].message.content
-                
-                if not content or not content.strip():
-                    if logger: logger(f"⚠️ AI returned empty content (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-                    continue
-
-                found_clips = _parse_json_clips(content)
-                if found_clips is not None:
-                    if found_clips:
-                        if logger: logger(f"🎯 Found {len(found_clips)} clip(s)!")
-                        all_clips.extend(found_clips)
-                    else:
-                        if logger: logger("🤷‍♂️ No clips found.")
-                    break
-                else:
-                    if logger: logger(f"⚠️ AI response was not valid JSON (Attempt {attempt}/3). Retrying...")
-                    time.sleep(1.5 * attempt)
-            except Exception as e:
-                # If extra_body was rejected by an incompatible proxy
-                if "extra_body" in create_kwargs and "thinking" in str(e).lower():
-                    del create_kwargs["extra_body"]
-                if attempt == 3:
-                    if logger: logger(f"❌ OpenAI/Custom API Error: {e}")
-                else:
-                    if logger: logger(f"⚠️ OpenAI/Custom API Error (Attempt {attempt}/3): {e}. Retrying...")
-                    time.sleep(1.5 * attempt)
-
-    return all_clips
 
 def process_video(file_path: str, prompt_profile: str = "Default", logger: Optional[Callable[[str], None]] = None, is_cancelled: Optional[Callable[[], bool]] = None) -> bool:
     """Main orchestration function for analyzing and cutting clips."""
@@ -863,16 +912,16 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     if active_prov == "deepseek":
         chat_model = config.get("deepseek_model", "deepseek-v4-flash")
     elif active_prov == "anthropic":
-        chat_model = config.get("anthropic_model", "claude-3-5-sonnet-latest")
+        chat_model = config.get("anthropic_model", "claude-sonnet-5")
     elif active_prov == "google":
-        chat_model = config.get("google_model", "gemini-2.5-flash")
+        chat_model = config.get("google_model", "gemini-3.5-flash")
     elif active_prov == "xai":
-        chat_model = config.get("xai_model", "grok-2-latest")
+        chat_model = config.get("xai_model", "grok-4.3")
     else:
-        chat_model = config.get("openai_model", "gpt-4o")
+        chat_model = config.get("openai_model", "gpt-5.5")
 
     if not chat_model:
-        chat_model = config.get("openai", {}).get("chat_model", "gpt-4o")
+        chat_model = config.get("openai", {}).get("chat_model", "gpt-5.5")
 
     clips_dir = config.get("settings", {}).get("clips_dir", "")
 
@@ -891,7 +940,20 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
 
     prompt_text = config.get("prompts", {}).get("profiles", {}).get(prompt_profile, "Find the best 15-90s moments. Output JSON.")
 
-    all_clips = _generate_clips_with_llm(segments, config, chat_model, prompt_text, logger)
+    candidates = _generate_clips_with_llm(segments, config, chat_model, prompt_text, logger, is_cancelled)
+    if is_cancelled and is_cancelled(): return False
+
+    settings_cfg = config.get("settings", {})
+    clips_per_hour = float(settings_cfg.get("clips_per_hour", highlights.DEFAULT_CLIPS_PER_HOUR))
+    duration = max((seg["end"] for seg in segments), default=0.0)
+    all_clips = highlights.select_clips(
+        candidates, duration,
+        clips_per_hour=clips_per_hour,
+        min_score=int(settings_cfg.get("min_clip_score", highlights.DEFAULT_MIN_SCORE)),
+    )
+    if logger and candidates:
+        logger(f"🎚️ Selected {len(all_clips)} of {len(candidates)} candidate(s) (density target: {clips_per_hour:g}/hour).")
+    all_clips = highlights.resolve_overlaps([highlights.refine_clip(clip, segments, duration) for clip in all_clips])
 
     if all_clips:
         if logger: logger(f"🎬 Sending {len(all_clips)} total timestamp(s) to FFmpeg...")
