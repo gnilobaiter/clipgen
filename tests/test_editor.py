@@ -827,3 +827,114 @@ def test_get_whisper_models_lists_everything_the_library_can_load(monkeypatch):
 
     monkeypatch.setattr("src.core.editor.whisper.available_models", MagicMock(side_effect=RuntimeError("broken")))
     assert editor.get_whisper_models("base") == editor.FALLBACK_WHISPER_MODELS
+
+
+# ==============================================================================
+# CUT POINTS: RANGED AUDIO EXTRACTION, EXPORTER PADDING, SNAPPING IN THE PIPELINE
+# ==============================================================================
+def test_extract_audio_hidden_can_read_only_a_range(monkeypatch):
+    recorded = {}
+    process = MagicMock(returncode=0)
+    process.communicate.return_value = (np.zeros(4, dtype=np.int16).tobytes(), b"")
+
+    def popen(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(editor, "_count_audio_streams", MagicMock(side_effect=AssertionError("must not probe again")))
+    result = editor.extract_audio_hidden("v.mp4", start=12.5, duration=3.0, num_audio=1)
+    cmd = recorded["cmd"]
+    assert len(result) == 4
+    assert cmd[cmd.index("-ss") + 1] == "12.500" and cmd[cmd.index("-t") + 1] == "3.000"
+    assert cmd.index("-ss") < cmd.index("-i")  # input seeking: fast even deep into a long recording
+
+
+def _capture_ffmpeg(monkeypatch):
+    commands = []
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        return MagicMock(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return commands
+
+
+def test_exporter_uses_per_clip_padding_and_keeps_legacy_defaults(tmp_path, monkeypatch):
+    commands = _capture_ffmpeg(monkeypatch)
+    monkeypatch.setattr(os.path, "isfile", lambda p: True)
+    clips = {"clips": [
+        {"start_time": 100.0, "end_time": 120.0, "virality_score": 8, "reasoning": "snapped", "pre_roll": 0.0, "post_roll": 0.0},
+        {"start_time": 200.0, "end_time": 220.0, "virality_score": 7, "reasoning": "legacy"},
+    ]}
+    editor.extract_clips("source.mp4", clips, str(tmp_path), logger=lambda m: None)
+    cut_commands = [c for c in commands if "-ss" in c and "-t" in c and "source.mp4" in c]
+    first, second = cut_commands
+    assert float(first[first.index("-ss") + 1]) == 100.0 and float(first[first.index("-t") + 1]) == 20.0
+    assert float(second[second.index("-ss") + 1]) == 199.25 and float(second[second.index("-t") + 1]) == 22.0
+
+
+def test_snap_helper_places_boundaries_and_reports(monkeypatch):
+    monkeypatch.setattr(editor, "_count_audio_streams", lambda f: 1)
+    sr = 16000
+    rng = np.random.default_rng(0)
+    audio = (rng.standard_normal(sr * 60) * 0.001).astype(np.float32)
+    t = np.arange(len(audio)) / sr
+    for a, b in [(9.0, 9.4), (9.6, 10.0), (11.0, 11.4), (11.6, 12.0), (12.2, 12.6)]:
+        m = (t >= a) & (t < b)
+        audio[m] += (0.3 * np.sin(2 * np.pi * 220 * t[m])).astype(np.float32)
+
+    monkeypatch.setattr(editor, "extract_audio_hidden", lambda f, s, length, n: audio[int(s * sr):int((s + length) * sr)])
+    logs = []
+    snapped = editor._snap_clips_to_pauses("v.mp4", [{"start_time": 11.1, "end_time": 12.3, "virality_score": 8}], 60.0, logs.append)
+    assert 10.0 < snapped[0]["start_time"] < 11.0 and snapped[0]["pre_roll"] == 0.0
+    assert any("boundaries inside speech pauses" in line for line in logs)
+
+    def broken(f, s, length, n):
+        raise RuntimeError("no audio")
+
+    monkeypatch.setattr(editor, "extract_audio_hidden", broken)
+    clip = {"start_time": 11.1, "end_time": 12.3}
+    result = editor._snap_clips_to_pauses("v.mp4", [clip], 60.0, logs.append)
+    assert result[0]["start_time"] == 11.1 and result[0]["pre_roll"] == 0.2  # unsnapped side keeps a tiny margin only
+
+    monkeypatch.setattr(editor, "_count_audio_streams", MagicMock(side_effect=RuntimeError("ffprobe missing")))
+    logs.clear()
+    assert editor._snap_clips_to_pauses("v.mp4", [clip], 60.0, logs.append) == [clip]
+    assert any("Could not snap" in line for line in logs)
+    assert editor._snap_clips_to_pauses("v.mp4", [], 60.0, None) == []
+
+
+def test_process_video_snaps_boundaries_and_logs_lengths(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips")},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 600.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "r"}])
+    seen = {}
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses",
+                        lambda f, clips, _d, logger: [dict(c, start_time=99.5, end_time=131.0, pre_roll=0.0, post_roll=0.0) for c in clips])
+
+    def fake_extract(f, data, *a, **k):
+        seen["clips"] = data["clips"]
+        return ["x.mp4"]
+
+    monkeypatch.setattr("src.core.editor.extract_clips", fake_extract)
+    logs = []
+    assert editor.process_video(str(video), logger=logs.append) is True
+    assert (seen["clips"][0]["start_time"], seen["clips"][0]["end_time"]) == (99.5, 131.0)
+    assert any("Clip lengths" in line for line in logs)
+
+
+def test_adjacent_nominations_of_one_moment_merge_up_to_the_configured_cap():
+    raw = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
+           {"start_time": 101, "end_time": 140, "virality_score": 8, "reasoning": "b"}]
+    assert len(editor._clean_and_merge_clips(raw)) == 1  # 140 s <= MAX_MERGED_CLIP_SECONDS
+    too_long = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
+                {"start_time": 101, "end_time": 260, "virality_score": 8, "reasoning": "b"}]
+    assert len(editor._clean_and_merge_clips(too_long)) == 2

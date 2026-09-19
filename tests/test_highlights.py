@@ -86,10 +86,18 @@ def test_select_clips_unlimited_keeps_all_valid():
 # --------------------------- boundary refinement ---------------------------
 def test_refine_snaps_start_and_end_to_phrase_boundaries():
     segments = [_seg(90.0, 100.0), _seg(100.0, 110.0), _seg(110.0, 118.0), _seg(130.0, 140.0)]
-    refined = hl.refine_clip(_clip(103.0, 113.0), segments, duration=1000)
+    refined = hl.refine_clip(_clip(101.5, 116.5), segments, duration=1000)
     # start inside phrase 100-110 -> back to its start; end inside 110-118 -> forward to its end
     assert refined["start_time"] == pytest.approx(100.0)
     assert refined["end_time"] == pytest.approx(118.0)
+
+
+def test_refine_does_not_stretch_a_clip_by_more_than_the_small_snap_radius():
+    long_segment = _seg(100.0, 140.0, "one long segment without words")
+    refined = hl.refine_clip(_clip(110.0, 130.0), [long_segment], duration=1000)
+    assert (refined["start_time"], refined["end_time"]) == (110.0, 130.0)  # nothing within 2 s to snap to
+    refined = hl.refine_clip(_clip(101.0, 139.0), [long_segment], duration=1000)
+    assert (refined["start_time"], refined["end_time"]) == (100.0, 140.0)
 
 
 def test_refine_extends_over_laughter_and_adds_tail():

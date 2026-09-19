@@ -18,11 +18,11 @@ OVERSAMPLE = 2.0  # ask the LLM for ~2x the target, selection trims it down
 MIN_CLIP_SECONDS = 5.0
 MIN_CLIP_GAP = 8.0  # min unclipped seconds between two selected clips
 
-EXPORT_PAD = 2.0  # extract_clips adds 0.75 s before + 1.25 s after every clip; refinement must not add its own
+EXPORT_PAD = 0.5  # minimum gap kept between neighbouring clips after refinement
 PEAK_LEAD = 4.0  # peak_time must have this much setup before it...
 PEAK_TAIL = 2.5  # ...and this much reaction after it
-MAX_SNAP_BACK = 6.0
-MAX_SNAP_FORWARD = 6.0
+MAX_SNAP_BACK = 2.0  # phrase snapping is only a coarse first step, cuts.py places the real boundary in a pause
+MAX_SNAP_FORWARD = 2.0
 MAX_LAUGH_EXTEND = 8.0
 LOUDNESS_TAG_MIN = 60  # only ~15% of lines rise 12+ dB above the local level; lower values tag half the transcript
 LONG_SEGMENT = 12.0  # segments longer than this are snapped at word level instead
@@ -156,7 +156,7 @@ def _speech_spans(segments: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
 
 def refine_clip(clip: Dict[str, Any], segments: List[Dict[str, Any]], duration: float) -> Dict[str, Any]:
     """Snaps a clip to speech boundaries, guarantees setup before / reaction after the peak, and
-    lets laughter finish. Padding is left to the exporter. Never shortens a clip below what the LLM asked for except by snapping
+    lets laughter finish. Never shortens a clip below what the LLM asked for except by snapping
     a boundary that landed inside a phrase."""
     spans = _speech_spans(segments)
     events = [s for s in segments if s.get("event")]
@@ -202,8 +202,7 @@ def refine_clip(clip: Dict[str, Any], segments: List[Dict[str, Any]], duration: 
 
 
 def resolve_overlaps(clips: List[Dict[str, Any]], pad: float = EXPORT_PAD) -> List[Dict[str, Any]]:
-    """Refinement can push neighbouring clips into each other; keep `pad` seconds (the exporter's own
-    pre/post-roll) between them, trimming the earlier clip's end, or the later clip's start if that would
+    """Refinement can push neighbouring clips into each other; keep `pad` seconds between them, trimming the earlier clip's end, or the later clip's start if that would
     leave the earlier one too short."""
     ordered = sorted((dict(c) for c in clips), key=lambda c: c["start_time"])
     for prev, nxt in zip(ordered, ordered[1:]):

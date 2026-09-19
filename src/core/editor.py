@@ -12,7 +12,7 @@ import numpy as np
 from openai import OpenAI
 import whisper
 
-from src.core import audio_events, highlights
+from src.core import audio_events, cuts, highlights
 from src.core import config as config_manager
 from src.utils.hardware import get_hardware_status, log_hardware_info
 from src.utils.paths import get_app_data_path, get_ffmpeg_path, get_ffprobe_path, inject_bin_to_path
@@ -125,8 +125,10 @@ def _count_audio_streams(video_file: str) -> int:
         pass
     return 1
 
-def extract_audio_hidden(video_file: str) -> np.ndarray:
-    """Extracts 16kHz mono audio directly into memory using FFmpeg.
+def extract_audio_hidden(video_file: str, start: Optional[float] = None, duration: Optional[float] = None,
+                         num_audio: Optional[int] = None) -> np.ndarray:
+    """Extracts 16kHz mono audio directly into memory using FFmpeg (the whole file, or only
+    [start, start + duration] when a range is given).
 
     Automatically detects and merges all audio streams (e.g. multi-track OBS
     recordings) into a single mono track via amix so Whisper and audio-peak
@@ -140,9 +142,15 @@ def extract_audio_hidden(video_file: str) -> np.ndarray:
         if hasattr(subprocess, 'SW_HIDE'):
             startupinfo.wShowWindow = subprocess.SW_HIDE
 
-    num_audio = _count_audio_streams(video_file)
+    if num_audio is None:
+        num_audio = _count_audio_streams(video_file)
 
-    cmd = [FFMPEG_PATH, "-nostdin", "-threads", "0", "-i", video_file]
+    cmd = [FFMPEG_PATH, "-nostdin", "-threads", "0"]
+    if start is not None:
+        cmd.extend(["-ss", f"{start:.3f}"])
+        if duration is not None:
+            cmd.extend(["-t", f"{duration:.3f}"])
+    cmd.extend(["-i", video_file])
 
     if num_audio > 1:
         # Build amix filter to merge all audio streams into one
@@ -270,9 +278,10 @@ def extract_clips(input_file: str, clips_data: Dict[str, Any], output_dir: str, 
         start_raw = float(clip["start_time"])
         end_raw = float(clip["end_time"])
 
-        # Smart padding: 0.75s pre-roll and 1.25s post-roll so speech and laughter never get clipped
-        start = max(0.0, start_raw - 0.75)
-        end = end_raw + 1.25
+        # Pre/post-roll: clips whose ends were snapped into speech pauses (cuts.snap_clip) carry 0, because padding
+        # blindly lands inside a neighbouring word. Clips from other callers keep the old 0.75 s / 1.25 s.
+        start = max(0.0, start_raw - float(clip.get("pre_roll", 0.75)))
+        end = end_raw + float(clip.get("post_roll", 1.25))
         duration = max(0.5, end - start)
         score = clip.get("virality_score", 5)
         reason = clip.get("reasoning", "viral moment")
@@ -452,7 +461,7 @@ def _clean_and_merge_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prev = merged[-1]
         if clip["start_time"] <= prev["end_time"] + 2.0:
             combined_duration = max(prev["end_time"], clip["end_time"]) - prev["start_time"]
-            if combined_duration <= 85.0:
+            if combined_duration <= MAX_MERGED_CLIP_SECONDS:
                 prev["end_time"] = max(prev["end_time"], clip["end_time"])
                 if clip["virality_score"] > prev["virality_score"] and "peak_time" in clip:
                     prev["peak_time"] = clip["peak_time"]
@@ -743,6 +752,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
         if logger: logger(f"❌ Transcription error: {e}")
         return None
 
+MAX_MERGED_CLIP_SECONDS = 150.0  # adjacent nominations of one moment are merged up to this length
 ANTHROPIC_MAX_OUTPUT_TOKENS = 8192  # per window (a handful of clips); stays under the SDK's non-streaming limit
 LLM_ATTEMPTS = 3
 MAX_CONSECUTIVE_WINDOW_FAILURES = 2
@@ -756,6 +766,7 @@ WINDOW_PROMPT = (
     "were detected in the raw audio (LAUGHTER/SCREAM by a pretrained sound classifier, the percentage is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
     "Nominate up to {want} candidate highlights from this section (fewer if it is mostly boring - never pad with weak moments). "
     "Rate each one on an ABSOLUTE 1-10 scale relative to the whole stream and only return candidates scoring 5 or higher. "
+    "Clip length must come from the content, never from a target: many of the best clips are short, and a long clip needs to be great all the way through. "
     "Return strictly valid JSON with a 'clips' array.\n\n"
     "{transcript}"
 )
@@ -973,6 +984,22 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
     return candidates
 
 
+def _snap_clips_to_pauses(file_path: str, clips: List[Dict[str, Any]], duration: float,
+                          logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
+    """Moves every clip start/end into a nearby pause in the audio so no word is cut in half."""
+    if not clips:
+        return clips
+    try:
+        num_audio = _count_audio_streams(file_path)
+        snapped = [cuts.snap_clip(c, lambda s, length: extract_audio_hidden(file_path, s, length, num_audio), duration) for c in clips]
+    except Exception as e:
+        if logger: logger(f"⚠️ Could not snap clip boundaries to speech pauses ({e}); using the AI timestamps as they are.")
+        return clips
+    done = sum(1 for c in snapped for k in ("pre_roll", "post_roll") if c.get(k) == 0.0)
+    if logger: logger(f"✂️ Placed {done} of {2 * len(snapped)} clip boundaries inside speech pauses (no cut words).")
+    return snapped
+
+
 def process_video(file_path: str, prompt_profile: str = "Default", logger: Optional[Callable[[str], None]] = None, is_cancelled: Optional[Callable[[], bool]] = None) -> bool:
     """Main orchestration function for analyzing and cutting clips."""
     if not os.path.exists(file_path):
@@ -1025,7 +1052,13 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     )
     if logger and candidates:
         logger(f"🎚️ Selected {len(all_clips)} of {len(candidates)} candidate(s) (density target: {clips_per_hour:g}/hour).")
-    all_clips = highlights.resolve_overlaps([highlights.refine_clip(clip, segments, duration) for clip in all_clips])
+    raw_lengths = [c["end_time"] - c["start_time"] for c in all_clips]
+    all_clips = [highlights.refine_clip(clip, segments, duration) for clip in all_clips]
+    all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
+    if logger and all_clips:
+        final_lengths = sorted(c["end_time"] - c["start_time"] for c in all_clips)
+        logger(f"📏 Clip lengths: from the AI median {sorted(raw_lengths)[len(raw_lengths) // 2]:.0f}s -> final median {final_lengths[len(final_lengths) // 2]:.0f}s "
+               f"(min {final_lengths[0]:.0f}s, max {final_lengths[-1]:.0f}s).")
 
     if all_clips:
         if logger: logger(f"🎬 Sending {len(all_clips)} total timestamp(s) to FFmpeg...")

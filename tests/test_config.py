@@ -36,6 +36,10 @@ def test_get_default_config():
     assert "peak_time" in default_prompt
     assert "LANGUAGE" in default_prompt
     assert "virality_score" in default_prompt
+    assert "HOW LONG" in default_prompt and "There is no target length" in default_prompt
+    # the old numeric "typical" ranges and the 90 s cap used to be read by the model as a length to aim for
+    for anchor in ("hard maximum", "15-45", "25-65", "Typical duration"):
+        assert anchor not in default_prompt
     assert config["settings"]["clips_per_hour"] == 12
     assert config["settings"]["min_clip_score"] == 6
 
