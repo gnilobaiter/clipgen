@@ -18,6 +18,8 @@ OVERSAMPLE = 2.0  # ask the LLM for ~2x the target, selection trims it down
 
 MIN_CLIP_SECONDS = 5.0
 MAX_CLIP_SECONDS = 240.0
+MIN_CONTEXT_SECONDS = 20.0  # a punchline clip shorter than this almost never carries the setup that makes it understandable
+MAX_CONTEXT_EXTENSION = 20.0
 SAFE_MAX_CLIP_SECONDS = MAX_CLIP_SECONDS - 8.0  # leaves room for the small pause-snapping shifts that come later
 MIN_CLIP_GAP = 8.0  # min unclipped seconds between two selected clips
 
@@ -141,6 +143,22 @@ def select_clips(candidates: List[Dict[str, Any]], duration: float, clips_per_ho
     if stats is not None:
         stats.update(counts)
     return sorted(chosen, key=lambda c: c["start_time"])
+
+
+def extend_short_clip(clip: Dict[str, Any], entries: List[Dict[str, Any]], min_len: float = MIN_CONTEXT_SECONDS,
+                      max_extend: float = MAX_CONTEXT_EXTENSION) -> Dict[str, Any]:
+    """Adds lead-in context to a clip that is too short to be understood on its own: the start moves back to the
+    nearest earlier utterance start that makes the clip at least `min_len` long (never more than `max_extend` back)."""
+    start, end = float(clip["start_time"]), float(clip["end_time"])
+    if end - start >= min_len:
+        return clip
+    wanted = end - min_len
+    starts = [float(e["start"]) for e in entries if not e.get("event") and start - max_extend <= float(e["start"]) <= wanted]
+    new_start = max(starts) if starts else max(wanted, start - max_extend)
+    new_start = max(0.0, min(new_start, start))
+    if new_start >= start:
+        return clip
+    return dict(clip, start_time=round(new_start, 2))
 
 
 def limit_length(clip: Dict[str, Any], max_len: float = SAFE_MAX_CLIP_SECONDS) -> Dict[str, Any]:

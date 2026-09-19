@@ -84,10 +84,13 @@ def test_pyside_app_save_settings(temp_config_env, monkeypatch):
     window.whisper_lang_combo.setCurrentText("Russian")
     window.whisper_model_combo.setCurrentText("turbo")
     window.hw_encode_checkbox.setChecked(True)
+    assert window.deepseek_thinking_checkbox.isChecked()  # on by default
+    window.deepseek_thinking_checkbox.setChecked(False)
 
     window._save_settings()
 
     saved = config_manager.load_config(cfg_file)
+    assert saved["settings"]["deepseek_thinking"] is False
     assert saved["openai"]["api_key"] == "sk-test-12345"
     assert saved["openai"]["whisper_language"] == "Russian"
     assert saved["openai"]["whisper_model"] == "turbo"

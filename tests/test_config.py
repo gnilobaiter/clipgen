@@ -142,3 +142,13 @@ def test_load_config_old_chat_model_migration(tmp_path, old_model, expected_prov
     config = load_config(filepath=str(cfg_path))
     assert config["active_ai_provider"] == expected_provider
     assert config[expected_key] == old_model
+
+
+def test_deepseek_reasoning_is_on_by_default_and_backfilled_into_old_configs(tmp_path):
+    assert get_default_config()["settings"]["deepseek_thinking"] is True
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"settings": {"clips_dir": "x"}}), encoding="utf-8")
+    assert load_config(str(old))["settings"]["deepseek_thinking"] is True
+    explicit = tmp_path / "off.json"
+    explicit.write_text(json.dumps({"settings": {"deepseek_thinking": False}}), encoding="utf-8")
+    assert load_config(str(explicit))["settings"]["deepseek_thinking"] is False

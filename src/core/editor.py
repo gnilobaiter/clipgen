@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -835,6 +836,10 @@ class _LLMRoute:
         self.is_grok = chat_model.startswith("grok") or active_provider == "xai"
         self.is_deepseek = "deepseek" in chat_model.lower() or active_provider == "deepseek" or "deepseek" in self.openai_base_url.lower()
 
+        # DeepSeek V4 has an optional reasoning ("thinking") mode. It is slower but decides noticeably better where a moment
+        # begins and ends (measured on the boundary review), so it is on by default and can be turned off in Settings.
+        self.thinking = self.is_deepseek and bool(config.get("settings", {}).get("deepseek_thinking", True))
+
         if self.is_grok:
             self.openai_key = config.get("xai", {}).get("api_key", "")
             self.openai_base_url = "https://api.x.ai/v1"
@@ -887,9 +892,9 @@ def _complete_text(route: _LLMRoute, system_prompt: str, user_prompt: str, extra
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
     }
-    # DeepSeek V4 has thinking mode enabled by default; disable it for structured JSON output
+    # DeepSeek V4: switch the reasoning mode explicitly (the API default is "enabled"), the same way for every request
     if route.is_deepseek and extra_body_enabled[0]:
-        create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        create_kwargs["extra_body"] = {"thinking": {"type": "enabled" if route.thinking else "disabled"}}
     try:
         response = client.chat.completions.create(**create_kwargs)
     except Exception as e:
@@ -983,11 +988,13 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
         logger(f"🤖 Routing to {route.engine_name} Engine ({chat_model}) with {len(segments)} segments...")
         logger(f"🏷️ Audio event tags included in the AI prompts: {_format_event_counts(segments)}.")
 
-    candidates: List[Dict[str, Any]] = []
-    consecutive_failures = 0
-    for idx, window in enumerate(windows, start=1):
-        if is_cancelled and is_cancelled():
-            return []
+    workers = LLM_WORKERS if route.thinking else 1
+    if logger and route.is_deepseek:
+        logger(f"🧠 DeepSeek reasoning mode: {'ON (slower, better decisions)' if route.thinking else 'OFF (fast)'}"
+               + (f", {workers} requests in parallel." if workers > 1 else "."))
+
+    def nominate(item: Any) -> Optional[List[Dict[str, Any]]]:
+        idx, window = item
         transcript = "".join(highlights.format_entry(e) for e in window["lines"])
         overlap_note = ""
         if len(windows) > 1:
@@ -998,7 +1005,11 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
             overlap_note=overlap_note, want=highlights.requested_candidates(window["end"] - window["start"], clips_per_hour),
             transcript=transcript,
         )
-        found = _request_json(route, prompt_text, user_prompt, _parse_json_clips, logger, f"window {idx}/{len(windows)}", extra_body_enabled)
+        return _request_json(route, prompt_text, user_prompt, _parse_json_clips, logger, f"window {idx}/{len(windows)}", extra_body_enabled)
+
+    candidates: List[Dict[str, Any]] = []
+    consecutive_failures = 0
+    for (idx, _window), found in _run_batches(list(enumerate(windows, start=1)), nominate, workers, is_cancelled):
         consecutive_failures = consecutive_failures + 1 if found is None else 0
         if found:
             if logger: logger(f"🎯 Window {idx}/{len(windows)}: {len(found)} candidate(s).")
@@ -1008,12 +1019,32 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
         if consecutive_failures >= MAX_CONSECUTIVE_WINDOW_FAILURES:
             if logger: logger(f"❌ {consecutive_failures} windows failed in a row - stopping (check your API key, model name and connection).")
             break
+    if is_cancelled and is_cancelled():
+        return []
 
     candidates = highlights.dedupe_candidates(candidates)
     if len(windows) > 1 and len(candidates) > 3 and not (is_cancelled and is_cancelled()):
         if logger: logger(f"⚖️ Re-ranking {len(candidates)} candidates on a common scale...")
         candidates = _rerank_candidates(route, candidates, segments, duration, logger, extra_body_enabled)
     return candidates
+
+
+LLM_WORKERS = 4  # parallel requests when the reasoning mode makes each one slow
+
+
+def _run_batches(items: List[Any], worker: Callable[[Any], Any], workers: int, is_cancelled: Optional[Callable[[], bool]]):
+    """Yields (item, result) in order, running `worker` on `workers` items at a time in threads. Stops quietly (before
+    starting the next batch) when cancelled; the consumer may also stop early by breaking out of the loop."""
+    for i in range(0, len(items), max(1, workers)):
+        if is_cancelled and is_cancelled():
+            return
+        batch = items[i:i + max(1, workers)]
+        if len(batch) == 1:
+            results = [worker(batch[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                results = list(pool.map(worker, batch))
+        yield from zip(batch, results)
 
 
 REVIEW_CONTEXT = 45.0
@@ -1036,8 +1067,10 @@ REVIEW_PROMPT = (
     "seen the stream. It is the scene with the payoff, plus the directly preceding scene(s) the payoff needs in order to be understood (the setup, the "
     "question, the running gag), plus the immediate reaction ONLY when it is about the same subject. A scene that starts a new subject (noticing a new device, "
     "panel or task, moving on to the next step) is never part of the clip, even when it follows the payoff directly. Never include filler, or scenes that "
-    "merely coordinate the game. Prefer the smallest range that is complete. A clip longer than 120 seconds must be entertaining throughout: if it contains "
-    "slow or purely coordinating stretches, keep only the best continuous stretch.\n\n"
+    "merely coordinate the game. A punchline without its setup is not a clip: the range must let a stranger understand who is talking to whom and what "
+    "event, question or line is being reacted to (an insult, a scream or a 'wow' needs the thing that caused it, usually the 10-30 seconds before it). "
+    "Only after that is satisfied, keep the range as tight as possible. A clip longer than 120 seconds must be entertaining throughout: if it contains "
+    "slow or purely coordinating stretches, keep only the best continuous stretch.{short_note}\n\n"
     "Return strictly valid JSON: {{\"scenes\": [{{\"start_time\": <float>, \"end_time\": <float>, \"topic\": \"...\", \"humor\": <int>}}, ...], "
     "\"clip_first\": <int>, \"clip_last\": <int>, \"reason\": \"<one short sentence>\"}}\n\n{excerpt}"
 )
@@ -1067,6 +1100,9 @@ def _accept_review(clip: Dict[str, Any], review: Dict[str, Any], duration: float
         return False
     if abs(start - clip["start_time"]) > REVIEW_CONTEXT or abs(end - clip["end_time"]) > REVIEW_CONTEXT:
         return False
+    original = clip["end_time"] - clip["start_time"]
+    if end - start < min(highlights.MIN_CONTEXT_SECONDS, 0.6 * original):  # shrinking to a bare punchline is how context got lost
+        return False
     overlap = min(end, clip["end_time"]) - max(start, clip["start_time"])
     return overlap >= 0.3 * min(end - start, clip["end_time"] - clip["start_time"])
 
@@ -1079,29 +1115,41 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
     self-contained moment. Splitting first matters: asked to merely "judge" a clip, a fast model called a clip that
     glued two topics together "one continuous exchange". This fixes clips that lack their setup, run into the next
     topic or drag on; pass 1 looks at 12 minutes at once and is much less precise about where a moment really is."""
-    reviewed: List[Dict[str, Any]] = []
-    failures = changed = 0
-    for i, clip in enumerate(clips, start=1):
-        if is_cancelled and is_cancelled():
-            return clips
-        if failures >= MAX_REVIEW_FAILURES:
-            reviewed.append(clip)
-            continue
+    workers = LLM_WORKERS if route.thinking else 1
+    if logger:
+        mode = f" (reasoning {'ON' if route.thinking else 'OFF'}, {workers} in parallel)" if route.is_deepseek else ""
+        logger(f"🔍 Reviewing the boundaries of {len(clips)} clip(s){mode}...")
+
+    def review_one(item: Any) -> Optional[Dict[str, Any]]:
+        i, clip = item
         lo, hi = clip["start_time"] - REVIEW_CONTEXT, clip["end_time"] + REVIEW_CONTEXT
         excerpt = "".join(("> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ") + highlights.format_entry(e)
                           for e in entries if e["end"] > lo and e["start"] < hi)
-        prompt = REVIEW_PROMPT.format(lo=lo, hi=hi, start=clip["start_time"], end=clip["end_time"], excerpt=excerpt)
-        review = _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
+        length = clip["end_time"] - clip["start_time"]
+        short_note = (f" NOTE: this clip is only {length:.0f} seconds long. Clips that short are almost always missing the situation that makes "
+                      "the punchline understandable: unless it is a complete joke on its own, start EARLIER and include the scene(s) that set it up."
+                      if length < 2 * highlights.MIN_CONTEXT_SECONDS else "")
+        prompt = REVIEW_PROMPT.format(lo=lo, hi=hi, start=clip["start_time"], end=clip["end_time"], excerpt=excerpt, short_note=short_note)
+        return _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
+
+    reviewed: List[Dict[str, Any]] = []
+    failures = changed = 0
+    for (i, clip), review in _run_batches(list(enumerate(clips, start=1)), review_one, workers, is_cancelled):
         if review is None:
             failures += 1
-            reviewed.append(clip)
-            continue
-        failures = 0
-        if _accept_review(clip, review, duration) and (abs(review["start_time"] - clip["start_time"]) > 0.5 or abs(review["end_time"] - clip["end_time"]) > 0.5):
-            changed += 1
-            if logger: logger(f"🔍 Clip {i}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s ({review['reason'][:110]})")
-            clip = dict(clip, start_time=round(review["start_time"], 2), end_time=round(review["end_time"], 2))
+        else:
+            failures = 0
+            if _accept_review(clip, review, duration) and (abs(review["start_time"] - clip["start_time"]) > 0.5 or abs(review["end_time"] - clip["end_time"]) > 0.5):
+                changed += 1
+                if logger: logger(f"🔍 Clip {i}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s ({review['reason'][:110]})")
+                clip = dict(clip, start_time=round(review["start_time"], 2), end_time=round(review["end_time"], 2))
         reviewed.append(clip)
+        if failures >= MAX_REVIEW_FAILURES:
+            if logger: logger("⚠️ The boundary review keeps failing - keeping the remaining clips as they are.")
+            break
+    if is_cancelled and is_cancelled():
+        return clips
+    reviewed.extend(clips[len(reviewed):])
     if logger: logger(f"🔍 Boundary review: {changed} of {len(clips)} clip(s) adjusted, the rest were already right.")
     return reviewed
 
@@ -1180,6 +1228,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     if all_clips and settings_cfg.get("review_boundaries", True):
         all_clips = _review_clip_boundaries(_LLMRoute(config, chat_model), all_clips, entries, duration, logger, is_cancelled, [True])
         if is_cancelled and is_cancelled(): return False
+    all_clips = [highlights.extend_short_clip(clip, entries) for clip in all_clips]
     all_clips = [highlights.limit_length(highlights.refine_clip(clip, entries, duration)) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
     if is_cancelled and is_cancelled(): return False

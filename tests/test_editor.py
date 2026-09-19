@@ -237,7 +237,7 @@ def test_deepseek_llm_routing(monkeypatch):
 
     assert len(clips) == 1
     call_kwargs = mock_client.chat.completions.create.call_args[1]
-    assert call_kwargs.get("extra_body") == {"thinking": {"type": "disabled"}}
+    assert call_kwargs.get("extra_body") == {"thinking": {"type": "enabled"}}  # reasoning is on by default
 
 
 def test_openai_retry_on_empty(monkeypatch):
@@ -1282,3 +1282,137 @@ def test_low_scored_candidates_are_parsed_and_left_for_selection_to_drop():
     from src.core import highlights
 
     assert highlights.select_clips(clips, duration=3600, min_score=6) == []
+
+
+# ==============================================================================
+# DEEPSEEK REASONING MODE, PARALLEL BATCHES
+# ==============================================================================
+def test_reasoning_flag_defaults_on_for_deepseek_only():
+    assert editor._LLMRoute({"active_ai_provider": "deepseek"}, "deepseek-v4-flash").thinking is True
+    assert editor._LLMRoute({"active_ai_provider": "deepseek", "settings": {"deepseek_thinking": False}}, "deepseek-v4-flash").thinking is False
+    assert editor._LLMRoute({"settings": {"deepseek_thinking": True}}, "gpt-5.5").thinking is False  # nothing to switch elsewhere
+    assert editor._LLMRoute({"settings": {"deepseek_thinking": True}}, "claude-sonnet-5").thinking is False
+
+
+def test_deepseek_request_carries_the_configured_reasoning_mode(monkeypatch):
+    for setting, expected in ((True, "enabled"), (False, "disabled")):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _openai_reply('{"clips": []}')
+        monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+        config = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek", "settings": {"deepseek_thinking": setting}}
+        editor._generate_clips_with_llm([{"start": 0.0, "end": 30.0, "text": "speech"}], config, "deepseek-v4-flash", "P", None)
+        assert mock_client.chat.completions.create.call_args[1]["extra_body"] == {"thinking": {"type": expected}}
+
+
+def test_log_says_whether_deepseek_runs_with_reasoning(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = _openai_reply('{"clips": []}')
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    segments = [{"start": 0.0, "end": 30.0, "text": "speech"}]
+    on, off, other = [], [], []
+    base = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek"}
+    editor._generate_clips_with_llm(segments, dict(base, settings={"deepseek_thinking": True}), "deepseek-v4-flash", "P", on.append)
+    editor._generate_clips_with_llm(segments, dict(base, settings={"deepseek_thinking": False}), "deepseek-v4-flash", "P", off.append)
+    editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", other.append)
+    assert any("DeepSeek reasoning mode: ON" in line and "4 requests in parallel" in line for line in on)
+    assert any("DeepSeek reasoning mode: OFF" in line for line in off) and not any("in parallel" in line for line in off)
+    assert not any("reasoning mode" in line for line in other)
+
+
+def test_run_batches_keeps_order_runs_in_parallel_and_stops_on_cancel():
+    import threading
+    import time
+
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def worker(x):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        time.sleep(0.02 * max(0, 5 - x))  # later items finish first
+        with lock:
+            state["now"] -= 1
+        return x * 10
+
+    assert list(editor._run_batches([1, 2, 3, 4, 5, 6], worker, 3, None)) == [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]
+    assert state["max"] == 3
+    state["max"] = 0
+    assert [r for _i, r in editor._run_batches([1, 2, 3], worker, 1, None)] == [10, 20, 30] and state["max"] == 1
+
+    calls = []
+
+    def counting(x):
+        calls.append(x)
+        return x
+
+    cancelled = {"now": False}
+
+    def cancel():
+        return cancelled["now"]
+
+    out = []
+    for item, _result in editor._run_batches(list(range(6)), counting, 2, cancel):
+        out.append(item)
+        cancelled["now"] = True  # cancel after the first batch was consumed
+    assert out == [0, 1] and calls == [0, 1]  # the second batch never started
+    assert list(editor._run_batches([], counting, 4, None)) == []
+
+
+def test_reasoning_mode_runs_windows_and_reviews_in_parallel(monkeypatch):
+    import threading
+    import time
+
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def fake_create(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        time.sleep(0.05)
+        with lock:
+            state["now"] -= 1
+        if user.startswith("Below are"):
+            n = user.count("\nid=") + 1
+            return _openai_reply(json.dumps({"scores": [{"id": i, "score": 8} for i in range(n)]}))
+        start = _window_index(user) * 600.0
+        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 7, "reasoning": "x"}]}))
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    config = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek", "settings": {"deepseek_thinking": True}}
+    clips = editor._generate_clips_with_llm(_long_segments(40), config, "deepseek-v4-flash", "P", None)
+    assert state["max"] > 1  # windows really ran side by side
+    starts = sorted(c["start_time"] for c in clips)
+    assert len(clips) >= 4 and starts == sorted(starts)
+
+    state["max"] = 0
+    off_config = dict(config, settings={"deepseek_thinking": False})
+    editor._generate_clips_with_llm(_long_segments(40), off_config, "deepseek-v4-flash", "P", None)
+    assert state["max"] == 1  # without reasoning the requests stay sequential
+
+
+def test_parallel_review_keeps_clip_order_and_stops_after_repeated_failures(monkeypatch):
+    def fake_create(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        if "from 50.0s to 90.0s" in user:  # clip 1
+            return _openai_reply(_scenes_reply([(20.0, 60.0, "setup"), (60.0, 90.0, "joke")], 0, 1))
+        raise RuntimeError("boom")
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    route = editor._LLMRoute({"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek"}, "deepseek-v4-flash")
+    assert route.thinking
+    clips = [{"start_time": 50.0 + 100 * i, "end_time": 90.0 + 100 * i, "virality_score": 7, "reasoning": "r"} for i in range(6)]
+    logs = []
+    result = REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, None, [True])
+    assert [c["end_time"] for c in result] == [c["end_time"] for c in clips]  # order kept
+    assert result[0]["start_time"] == 20.0  # the one good answer was applied to the right clip
+    assert all(r["start_time"] == c["start_time"] for r, c in zip(result[1:], clips[1:]))
+    assert any("reasoning ON, 4 in parallel" in line for line in logs)
+    assert any("keeps failing" in line for line in logs)

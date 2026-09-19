@@ -1163,6 +1163,9 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "",
             self._test_deepseek_key
         )
+        self.deepseek_thinking_checkbox = QtWidgets.QCheckBox("Reasoning (thinking) mode: better clip choices and boundaries, but slower", deepseek_panel)
+        self.deepseek_thinking_checkbox.setChecked(bool(self.config.get("settings", {}).get("deepseek_thinking", True)))
+        deepseek_panel.layout().addWidget(self.deepseek_thinking_checkbox)
         self.provider_stack.addWidget(deepseek_panel)
 
         # 3. Anthropic Panel
@@ -1752,6 +1755,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         settings["audio_peak_detection"] = self.peak_checkbox.isChecked()
         settings["combat_detection"] = self.combat_checkbox.isChecked()
         settings["clips_per_hour"] = self.clips_per_hour_spin.value()
+        settings["deepseek_thinking"] = self.deepseek_thinking_checkbox.isChecked()
         settings["hardware_encoding"] = self.hw_encode_checkbox.isChecked()
         settings["vr_stabilization"] = self.vr_checkbox.isChecked()
         settings["vertical_export"] = self.vertical_checkbox.isChecked()

@@ -14,6 +14,7 @@ SAMPLE_RATE = 16000
 FRAME = SAMPLE_RATE // 100  # 10 ms
 SMOOTH_FRAMES = 3
 MIN_PAUSE = 0.10  # s; shorter dips are consonant closures inside words, not pauses
+REAL_PAUSE = 0.30  # s; a pause that can end a phrase (shorter ones are usually breaths inside continuing speech)
 QUIET_FRACTION = 0.30  # a frame is "quiet" below floor + 30% of the way up to the speech level
 MIN_CONTRAST_DB = 8.0  # windows without this much speech/quiet contrast cannot be snapped
 SEARCH_TIERS = (1.6, 3.5)  # s to look earlier than the target for a start cut / later for an end cut; wider on retry
@@ -57,7 +58,8 @@ def find_pauses(db: np.ndarray) -> List[Tuple[int, int]]:
     return pauses
 
 
-def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, reach: float = SEARCH_TIERS[0]) -> Optional[float]:
+def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, reach: float = SEARCH_TIERS[0],
+             min_pause: float = MIN_PAUSE) -> Optional[float]:
     """Absolute time of the best cut near `target` (kind = "start" or "end"), or None if no pause is nearby.
 
     `audio` holds the samples that begin at absolute time `window_start`."""
@@ -70,7 +72,7 @@ def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, r
     best, best_score = None, None
     for first, last in pauses:
         p_start, p_end = first * 0.01, (last + 1) * 0.01
-        if p_end < lo or p_start > hi:
+        if p_end - p_start < min_pause - 1e-9 or p_end < lo or p_start > hi:
             continue
         distance = 0.0 if p_start <= rel <= p_end else min(abs(rel - p_start), abs(rel - p_end))
         score = distance - 1.0 * min(p_end - p_start, 0.8)  # nearer wins, but a real pause beats a tiny gap between words
@@ -99,7 +101,11 @@ def snap_clip(clip: Dict[str, Any], get_audio: Callable[[float, float], np.ndarr
             if win_end - win_start < 1.0:
                 break
             try:
-                cut = find_cut(get_audio(win_start, win_end - win_start), win_start, target, kind, reach)
+                audio = get_audio(win_start, win_end - win_start)
+                for min_pause in (REAL_PAUSE, MIN_PAUSE):  # a real pause beats a breath inside continuing speech
+                    cut = find_cut(audio, win_start, target, kind, reach, min_pause)
+                    if cut is not None:
+                        break
             except Exception:
                 cut = None
             if cut is not None:
