@@ -226,7 +226,9 @@ def test_detect_sound_events_uses_isolated_process(monkeypatch):
     logs = []
     events = sc.detect_sound_events(np.zeros(sc.SAMPLE_RATE * 30, dtype=np.float32), logs.append)
     assert [e["type"] for e in events] == ["LAUGHTER"] and events[0]["start"] == pytest.approx(20 * 0.48)
-    assert any("GPU" in line and "separate process" in line for line in logs)
+    assert any("Running the YAMNet" in line for line in logs)  # visible start message
+    finished = [line for line in logs if "YAMNet finished" in line]
+    assert finished and "GPU / CUDA" in finished[0] and "separate process" in finished[0] and "1 laughter and 0 scream" in finished[0]
 
 
 def test_detect_sound_events_falls_back_to_cpu_when_worker_crashes(monkeypatch):
@@ -246,6 +248,7 @@ def test_detect_sound_events_falls_back_to_cpu_when_worker_crashes(monkeypatch):
     events = sc.detect_sound_events(np.zeros(sc.SAMPLE_RATE * 10, dtype=np.float32), logs.append)
     assert [e["type"] for e in events] == ["SCREAM"]
     assert any("retrying on CPU" in line for line in logs)
+    assert any("YAMNet finished on CPU (inside the app)" in line and "0 laughter and 1 scream" in line for line in logs)
 
 
 def test_detect_sound_events_degrades_gracefully(monkeypatch):

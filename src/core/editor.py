@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+import warnings
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -16,6 +17,10 @@ from src.core import audio_events, cuts, highlights
 from src.core import config as config_manager
 from src.utils.hardware import get_hardware_status, log_hardware_info
 from src.utils.paths import get_app_data_path, get_ffmpeg_path, get_ffprobe_path, inject_bin_to_path
+
+# openai-whisper tries Triton GPU kernels for word timestamps (median filter, DTW). Triton does not exist on Windows,
+# so whisper falls back to slower but equivalent implementations and warns once per 30 s of audio. Harmless noise.
+warnings.filterwarnings("ignore", message="Failed to launch Triton kernels", category=UserWarning)
 
 inject_bin_to_path()
 FFMPEG_PATH = get_ffmpeg_path()
@@ -36,13 +41,22 @@ try:
 except ImportError:
     HAS_ANTHROPIC = False
 
+class TranscriptionCancelled(Exception):
+    """Raised from inside Whisper's progress printing to abort a running transcription."""
+
+
 class WhisperProgressStream(io.StringIO):
-    def __init__(self, logger: Optional[Callable[[str], None]]):
+    def __init__(self, logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]] = None):
         super().__init__()
         self.logger = logger
+        self.is_cancelled = is_cancelled
         self.counter = 0
 
     def write(self, s: str) -> int:
+        # whisper.transcribe() has no cancel hook, but with verbose=True it prints every segment to stdout,
+        # which is redirected here: raising from this print is the only way to stop a running transcription.
+        if self.is_cancelled and self.is_cancelled():
+            raise TranscriptionCancelled()
         raw_msg = s.strip()
         if raw_msg and "-->" in raw_msg:
             # Throttle to log only every 10th segment to prevent UI spam lag
@@ -595,6 +609,14 @@ def _annotate_with_audio(audio_array: np.ndarray, raw_segments: List[Dict[str, A
     return segments
 
 
+def _format_event_counts(segments: List[Dict[str, Any]]) -> str:
+    counts: Dict[str, int] = {}
+    for seg in segments:
+        if seg.get("event"):
+            counts[seg["event"]] = counts.get(seg["event"], 0) + 1
+    return ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "none"
+
+
 def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
     """Laughter / scream / loud-burst detection as timeline entries; never fails the whole transcription."""
     try:
@@ -682,6 +704,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
     cache_file = _get_transcription_cache_path(file_path, whisper_model_type, target_language, audio_peak_detection, combat_detection)
     cached_segments = _load_cached_segments(cache_file, logger)
     if cached_segments is not None:
+        if logger: logger(f"🔊 Audio events stored in the cache: {_format_event_counts(cached_segments)} (sound classifier not re-run).")
         return cached_segments
 
     migrated = _migrate_legacy_cache(file_path, cache_file, whisper_model_type, target_language, audio_peak_detection, combat_detection, logger, is_cancelled)
@@ -720,7 +743,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
             logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}]...")
             
     try:
-        progress_stream = WhisperProgressStream(logger)
+        progress_stream = WhisperProgressStream(logger, is_cancelled)
         with contextlib.redirect_stdout(progress_stream):
             transcribe_kwargs: Dict[str, Any] = {
                 "condition_on_previous_text": False,
@@ -748,6 +771,9 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
             _save_cached_segments(cache_file, segments, logger)
         return segments
 
+    except TranscriptionCancelled:
+        if logger: logger("🛑 Transcription cancelled.")
+        return None
     except Exception as e:
         if logger: logger(f"❌ Transcription error: {e}")
         return None
@@ -950,6 +976,7 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
     if logger:
         logger(f"📊 Extracted approx {int(word_count * 1.3):,} tokens ({word_count:,} words) in {len(windows)} window(s) for the AI model.")
         logger(f"🤖 Routing to {route.engine_name} Engine ({chat_model}) with {len(segments)} segments...")
+        logger(f"🏷️ Audio event tags included in the AI prompts: {_format_event_counts(segments)}.")
 
     candidates: List[Dict[str, Any]] = []
     consecutive_failures = 0
@@ -1055,6 +1082,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     raw_lengths = [c["end_time"] - c["start_time"] for c in all_clips]
     all_clips = [highlights.refine_clip(clip, segments, duration) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
+    if is_cancelled and is_cancelled(): return False
     if logger and all_clips:
         final_lengths = sorted(c["end_time"] - c["start_time"] for c in all_clips)
         logger(f"📏 Clip lengths: from the AI median {sorted(raw_lengths)[len(raw_lengths) // 2]:.0f}s -> final median {final_lengths[len(final_lengths) // 2]:.0f}s "

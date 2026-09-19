@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -167,6 +168,8 @@ def scores_to_events(scores: np.ndarray) -> List[Dict[str, Any]]:
 def detect_sound_events(audio: np.ndarray, logger: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
     """Laughter / screaming events from the classifier. Any failure (no network for the first model download,
     missing onnxruntime, driver problems) is reported through `logger` and yields no events."""
+    if logger: logger("🎧 Running the YAMNet sound-event classifier (ONNX) to find laughter and screams...")
+    started = time.perf_counter()
     try:
         model_path = ensure_model(logger)
     except Exception as e:
@@ -174,12 +177,17 @@ def detect_sound_events(audio: np.ndarray, logger: Optional[Callable[[str], None
         return []
     try:
         scores, provider = _classify_isolated(audio, model_path)
-        if logger: logger(f"🎧 Sound-event classifier finished on {'GPU / CUDA' if provider == 'CUDAExecutionProvider' else 'CPU'} (separate process).")
+        where = f"{'GPU / CUDA' if provider == 'CUDAExecutionProvider' else 'CPU'} (separate process)"
     except Exception as e:
         if logger: logger(f"⚠️ GPU classifier process failed ({e}); retrying on CPU inside the app...")
         try:
             scores = classify_frames(audio, _get_cpu_session(model_path))
+            where = "CPU (inside the app)"
         except Exception as e2:
             if logger: logger(f"⚠️ Sound-event classifier unavailable ({e2}); continuing without laughter/scream tags.")
             return []
-    return scores_to_events(scores)
+    events = scores_to_events(scores)
+    if logger:
+        laughs = sum(e["type"] == "LAUGHTER" for e in events)
+        logger(f"🎧 YAMNet finished on {where} in {time.perf_counter() - started:.1f}s: {laughs} laughter and {len(events) - laughs} scream event(s) found.")
+    return events

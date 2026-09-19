@@ -446,18 +446,20 @@ class ClipExtractionWorker(QtCore.QThread):
                 self.signals.log_message.emit(msg, "manual")
 
             try:
-                success = editor.process_video(file_path, prompt_profile=self.profile, logger=thread_logger)
+                success = editor.process_video(file_path, prompt_profile=self.profile, logger=thread_logger,
+                                               is_cancelled=lambda: self.is_cancelled)
                 if not success:
                     overall_success = False
             except Exception as e:
                 self.signals.log_message.emit(f"❌ Unhandled Exception: {e}", "manual")
                 overall_success = False
 
-        if not self.is_cancelled:
-            if overall_success:
-                self.signals.log_message.emit("✨ All queued videos processed successfully!", "manual")
-            else:
-                self.signals.log_message.emit("⚠️ Batch completed with some warnings/errors.", "manual")
+        if self.is_cancelled:
+            self.signals.log_message.emit("🛑 Processing cancelled by user.", "manual")
+        elif overall_success:
+            self.signals.log_message.emit("✨ All queued videos processed successfully!", "manual")
+        else:
+            self.signals.log_message.emit("⚠️ Batch completed with some warnings/errors.", "manual")
 
         self.signals.finished.emit(overall_success)
 

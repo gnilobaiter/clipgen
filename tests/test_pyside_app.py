@@ -234,3 +234,45 @@ def test_pyside_extraction_worker():
     worker.run()
 
     assert any("File not found" in log for log in logs)
+
+
+def test_pyside_worker_passes_the_cancel_flag_into_process_video(tmp_path, monkeypatch):
+    """Regression: Cancel did nothing because process_video never received is_cancelled."""
+    video = tmp_path / "clip.mp4"
+    video.write_text("x")
+    signals = WorkerSignals()
+    logs = []
+    signals.log_message.connect(lambda msg, _src: logs.append(msg))
+    worker = ClipExtractionWorker(str(video), "Default", signals)
+    seen = {}
+
+    def fake_process_video(path, prompt_profile="Default", logger=None, is_cancelled=None):
+        seen["callable"] = callable(is_cancelled)
+        seen["before"] = is_cancelled()
+        worker.cancel()  # the user presses Cancel while the pipeline is running
+        seen["after"] = is_cancelled()
+        return False
+
+    monkeypatch.setattr("src.ui.pyside_app.editor.process_video", fake_process_video)
+    worker.run()
+    assert seen == {"callable": True, "before": False, "after": True}
+    assert any("cancelled by user" in line for line in logs)
+    assert not any("processed successfully" in line for line in logs)
+
+
+def test_pyside_worker_stops_the_queue_after_cancel(tmp_path, monkeypatch):
+    first, second = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    first.write_text("x")
+    second.write_text("x")
+    signals = WorkerSignals()
+    worker = ClipExtractionWorker(f"{first};{second}", "Default", signals)
+    processed = []
+
+    def fake_process_video(path, prompt_profile="Default", logger=None, is_cancelled=None):
+        processed.append(os.path.basename(path))
+        worker.cancel()
+        return True
+
+    monkeypatch.setattr("src.ui.pyside_app.editor.process_video", fake_process_video)
+    worker.run()
+    assert processed == ["a.mp4"]

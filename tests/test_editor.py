@@ -938,3 +938,109 @@ def test_adjacent_nominations_of_one_moment_merge_up_to_the_configured_cap():
     too_long = [{"start_time": 0, "end_time": 100, "virality_score": 7, "reasoning": "a"},
                 {"start_time": 101, "end_time": 260, "virality_score": 8, "reasoning": "b"}]
     assert len(editor._clean_and_merge_clips(too_long)) == 2
+
+
+def test_whisper_triton_fallback_warning_is_silenced():
+    import importlib
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        importlib.reload(editor)  # re-runs the module-level filter registration inside this warnings context
+        warnings.warn("Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower DTW implementation...", UserWarning)
+        warnings.warn("some other warning", UserWarning)
+    assert [str(w.message) for w in caught] == ["some other warning"]
+
+
+# ==============================================================================
+# LOGGING: THE USER MUST BE ABLE TO SEE WHETHER THE SOUND MODEL IS USED
+# ==============================================================================
+def test_cache_hit_reports_stored_audio_events(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    cache_file = editor._get_transcription_cache_path(str(video), "base", "en", True, True)
+    editor._save_cached_segments(cache_file, [
+        {"start": 0.0, "end": 5.0, "text": "hi"},
+        {"start": 1.0, "end": 3.0, "text": "", "event": "LAUGHTER", "strength": 60},
+        {"start": 2.0, "end": 3.0, "text": "", "event": "LAUGHTER", "strength": 40},
+        {"start": 4.0, "end": 4.5, "text": "", "event": "LOUD", "strength": 70},
+    ])
+    logs = []
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {}}
+    editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+    assert any("Audio events stored in the cache: LAUGHTER: 2, LOUD: 1" in line and "not re-run" in line for line in logs)
+
+    editor._save_cached_segments(cache_file, [{"start": 0.0, "end": 5.0, "text": "hi"}])
+    logs.clear()
+    editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+    assert any("Audio events stored in the cache: none" in line for line in logs)
+
+
+def test_llm_stage_logs_the_audio_tags_it_sends(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = _openai_reply('{"clips": []}')
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    segments = [{"start": 0.0, "end": 30.0, "text": "speech"},
+                {"start": 10.0, "end": 12.0, "text": "", "event": "LAUGHTER", "strength": 55},
+                {"start": 20.0, "end": 21.0, "text": "", "event": "SCREAM", "strength": 40}]
+    logs = []
+    editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", logs.append)
+    assert any("Audio event tags included in the AI prompts: LAUGHTER: 1, SCREAM: 1" in line for line in logs)
+    prompt = mock_client.chat.completions.create.call_args[1]["messages"][1]["content"]
+    assert "[LAUGHTER 55%]" in prompt and "[SCREAM 40%]" in prompt  # and they really are in the text the model reads
+
+
+# ==============================================================================
+# CANCELLATION
+# ==============================================================================
+def test_cancel_interrupts_a_running_whisper_transcription(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000 * 10, dtype=np.float32))
+    printed = {"segments": 0}
+    state = {"cancel": False}
+
+    def fake_transcribe(audio, **kwargs):
+        for i in range(1000):  # what whisper does with verbose=True: print every segment as it is decoded
+            print(f"[00:{i % 60:02d}.000 --> 00:{i % 60 + 1:02d}.000] segment {i}")
+            printed["segments"] += 1
+            if printed["segments"] == 3:
+                state["cancel"] = True  # the user presses Cancel
+        return {"segments": []}
+
+    mock_model = MagicMock()
+    mock_model.transcribe.side_effect = fake_transcribe
+    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *a, **k: mock_model)
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    logs = []
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {}}
+    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, lambda: state["cancel"])
+    assert result is None
+    assert printed["segments"] == 3  # stopped right away instead of decoding all 1000
+    assert any("Transcription cancelled" in line for line in logs)
+    assert not any("Transcription error" in line for line in logs)
+    assert not any(cache_file.endswith(".json") for cache_file in os.listdir(tmp_path / "appdata" / "transcripts")) if (tmp_path / "appdata" / "transcripts").exists() else True
+
+
+def test_process_video_does_not_export_after_cancel_during_boundary_snapping(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips")},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: [{"start": 0.0, "end": 600.0, "text": "talk"}])
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "r"}])
+    state = {"cancel": False}
+
+    def snap(f, clips, _d, logger):
+        state["cancel"] = True
+        return clips
+
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses", snap)
+    export = MagicMock()
+    monkeypatch.setattr("src.core.editor.extract_clips", export)
+    assert editor.process_video(str(video), is_cancelled=lambda: state["cancel"]) is False
+    export.assert_not_called()

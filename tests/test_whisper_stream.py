@@ -43,3 +43,17 @@ def test_whisper_progress_stream_flush():
     stream = WhisperProgressStream(logger=lambda msg: None)
     # flush should execute without error
     stream.flush()
+
+
+def test_progress_stream_aborts_transcription_when_cancelled():
+    import pytest
+
+    from src.core.editor import TranscriptionCancelled
+
+    state = {"cancel": False}
+    stream = WhisperProgressStream(logger=None, is_cancelled=lambda: state["cancel"])
+    stream.write("[00:00.000 --> 00:05.000] fine\n")
+    state["cancel"] = True
+    with pytest.raises(TranscriptionCancelled):
+        stream.write("[00:05.000 --> 00:10.000] too late\n")
+    assert WhisperProgressStream(logger=None).write("x") == 1  # no callback: never raises
