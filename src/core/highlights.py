@@ -52,6 +52,24 @@ def format_entry(entry: Dict[str, Any]) -> str:
     return f"[{start:.1f}s - {end:.1f}s] {prefix + ' ' if prefix else ''}{text}\n"
 
 
+PAUSE_MARK_SECONDS = 0.8  # silences at least this long are shown to the AI as a "⏸" line
+
+
+def format_transcript(lines: List[Dict[str, Any]], mark: Optional[Any] = None) -> str:
+    """Transcript text for the AI. Between two spoken lines that are at least PAUSE_MARK_SECONDS apart a
+    "⏸ 1.4s" line is inserted: lines WITHOUT such a marker between them are continuous speech (a clip that starts
+    or ends there usually cuts a sentence or a reaction in half). `mark(entry)` may return a prefix per line."""
+    out: List[str] = []
+    prev_end: Optional[float] = None
+    for entry in lines:
+        if not entry.get("event"):
+            if prev_end is not None and float(entry["start"]) - prev_end >= PAUSE_MARK_SECONDS:
+                out.append(f"  ⏸ {float(entry['start']) - prev_end:.1f}s\n")
+            prev_end = max(prev_end or 0.0, float(entry["end"]))
+        out.append((mark(entry) if mark else "") + format_entry(entry))
+    return "".join(out)
+
+
 def build_windows(entries: List[Dict[str, Any]], window: float = WINDOW_SECONDS, overlap: float = WINDOW_OVERLAP) -> List[Dict[str, Any]]:
     """Splits a timeline into overlapping windows. Each window: {start, end, lines: [entry,...]}."""
     if not entries:
@@ -159,6 +177,89 @@ def extend_short_clip(clip: Dict[str, Any], entries: List[Dict[str, Any]], min_l
     if new_start >= start:
         return clip
     return dict(clip, start_time=round(new_start, 2))
+
+
+# --------------------------------------------------------------------------------------
+# Finishing the thought: a pause is not the end of an idea
+# --------------------------------------------------------------------------------------
+CONTINUE_GAP_OPEN = 1.5  # the last line has no sentence end: the next line up to this far away is still the same sentence
+CONTINUE_GAP_CLOSED = 1.0  # the last line ended a sentence: only a reaction / closing remark that follows this closely still belongs to it
+REACTION_MAX_SECONDS = 3.0
+PARTIAL_TAIL_SECONDS = 2.2  # a long line right after the punchline usually opens with the closing remark: take its first moments
+MAX_TAIL_EXTENSION = 6.0
+MAX_TAIL_STEPS = 3
+CONTINUE_GAP_HEAD = 0.8
+MAX_HEAD_EXTENSION = 5.0
+MAX_HEAD_STEPS = 2
+
+
+def complete_thoughts(clip: Dict[str, Any], entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Moves the clip ends so that they do not fall in the middle of an idea.
+
+    Cutting at the nearest pause is not enough: a hesitation in the middle of a sentence is a pause too, and the closing
+    remark of a joke ("...and that makes total sense") usually follows the punchline after half a second. Using the
+    transcript:
+      * end: if the last line has no sentence end and the next line follows within CONTINUE_GAP_OPEN, the sentence
+        goes on - take the next line; if it ended a sentence, only a short reaction (<= REACTION_MAX_SECONDS) that
+        follows within CONTINUE_GAP_CLOSED is taken. Bounded by MAX_TAIL_EXTENSION.
+      * start: if the line before the start has no sentence end and is directly adjacent, the clip begins in the middle
+        of that sentence - begin at its start. Bounded by MAX_HEAD_EXTENSION."""
+    utts = sorted((e for e in entries if not e.get("event")), key=lambda e: float(e["start"]))
+    if not utts:
+        return clip
+    start, end = float(clip["start_time"]), float(clip["end_time"])
+    orig_start, orig_end = start, end
+
+    for _ in range(MAX_TAIL_STEPS):
+        inside = [u for u in utts if float(u["start"]) < end - 0.05]
+        if not inside:
+            break
+        last = inside[-1]
+        if float(last["end"]) > end + 0.05:  # the clip stops in the middle of a line: finish it
+            if float(last["end"]) - orig_end > MAX_TAIL_EXTENSION:
+                break
+            end = float(last["end"])
+            continue
+        nxt = next((u for u in utts if float(u["start"]) >= float(last["end"]) - 0.02 and u is not last), None)
+        if nxt is None:
+            break
+        gap = float(nxt["start"]) - float(last["end"])
+        closed = bool(_SENTENCE_END.search(str(last.get("text", ""))))
+        nxt_len = float(nxt["end"]) - float(nxt["start"])
+        if closed:
+            if gap > CONTINUE_GAP_CLOSED:
+                break
+            if nxt_len > REACTION_MAX_SECONDS:  # a long line: only its opening (the pause snapping picks the exact cut)
+                end = min(float(nxt["start"]) + PARTIAL_TAIL_SECONDS, orig_end + MAX_TAIL_EXTENSION)
+                break
+        elif gap > CONTINUE_GAP_OPEN:
+            break
+        if float(nxt["end"]) - orig_end > MAX_TAIL_EXTENSION:
+            break
+        end = float(nxt["end"])
+
+    for _ in range(MAX_HEAD_STEPS):
+        containing = [u for u in utts if float(u["start"]) <= start + 0.05 < float(u["end"])]
+        first = containing[-1] if containing else next((u for u in utts if float(u["start"]) >= start - 0.05), None)
+        if first is None:
+            break
+        if float(first["start"]) < start - 0.05:  # starts inside a line: begin at its start
+            if orig_start - float(first["start"]) > MAX_HEAD_EXTENSION:
+                break
+            start = float(first["start"])
+            continue
+        earlier = [u for u in utts if float(u["end"]) <= float(first["start"]) + 0.02 and u is not first]
+        if not earlier:
+            break
+        prev = earlier[-1]
+        gap = float(first["start"]) - float(prev["end"])
+        if gap > CONTINUE_GAP_HEAD or _SENTENCE_END.search(str(prev.get("text", ""))) or orig_start - float(prev["start"]) > MAX_HEAD_EXTENSION:
+            break
+        start = float(prev["start"])
+
+    if (start, end) == (orig_start, orig_end):
+        return clip
+    return dict(clip, start_time=round(start, 2), end_time=round(end, 2))
 
 
 def limit_length(clip: Dict[str, Any], max_len: float = SAFE_MAX_CLIP_SECONDS) -> Dict[str, Any]:

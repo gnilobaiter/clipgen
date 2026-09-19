@@ -75,6 +75,7 @@ def get_default_config() -> Dict[str, Any]:
                     'Each line: [start - end] then optional tags, then speech. All times are absolute seconds in the source video.\n'
                     '- [LOUDNESS: X%] - the line rises X% of the way (0-100) above the local background level. Shown only when notable: screaming, laughing, shouting.\n'
                     '- [ACTION: COMBAT] - sharp gunshot / explosion / impact transients.\n'
+                    "- A line like '⏸ 1.4s' between two lines is a real silence of that length. Lines with NO ⏸ between them are one continuous stretch of speech.\n"
                     '- Standalone lines like [LAUGHTER 60%], [SCREAM 45%], [LOUD 60%] are detected in the raw audio: LAUGHTER / SCREAM by a pretrained sound classifier (the percentage is its confidence, so 30-50% is already a real signal), LOUD by a loudness detector. They can be wrong. A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these tags when the text looks flat.\n'
                     '\n'
                     '### WHAT IS A HIGHLIGHT\n'
@@ -84,8 +85,8 @@ def get_default_config() -> Dict[str, Any]:
                     '\n'
                     '### WHAT MAKES A GOOD CLIP RANGE (this matters most)\n'
                     '- A clip is watched ON ITS OWN by someone who has never seen the stream. It must be understandable and satisfying without anything before or after it.\n'
-                    "- START where the situation becomes understandable: the question that gets answered, the premise, the thing that just happened and is being reacted to. If the payoff needs an earlier line to make sense, include that line, even if it is 10-20 s earlier. Start on a line's [start], never in the middle of a sentence or an exchange.\n"
-                    "- END after the payoff AND its reaction has resolved (the laugh, the exclamation, the answer), on a line's [end]. Never cut a joke, sentence or back-and-forth off, and stop before the conversation moves to another topic.\n"
+                    "- START where the situation becomes understandable: the question that gets answered, the premise, the thing that just happened and is being reacted to. If the payoff needs an earlier line to make sense, include that line, even if it is 10-20 s earlier. Start on a line's [start], preferably right after a ⏸ pause, never in the middle of a sentence or an exchange.\n"
+                    "- END after the payoff AND its reaction has resolved (the laugh, the exclamation, the answer) AND the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): ending one line too early feels cut off. End on a line's [end], preferably right before a ⏸ pause. Never cut a joke, sentence or back-and-forth off, and stop before the conversation moves to another topic.\n"
                     '- ONE moment, ONE topic per clip. A clip must never contain a topic change. Two moments are two clips, even when they follow each other directly.\n'
                     '- Length is only the RESULT of these rules: there is no target and no "typical" length, never aim for one. A one-liner with its laugh can be 8-25 s, a banter exchange 20-60 s, a stretch that is continuously great 1-3 minutes. Absolute maximum 240 s. Do not pad: skip lead-in chatter and stop when the moment is over.\n'
                     '\n'

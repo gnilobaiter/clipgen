@@ -1580,3 +1580,48 @@ def test_no_clips_means_no_cutting_stage(tmp_path, monkeypatch):
 
 def test_format_duration():
     assert editor._format_duration(42.4) == "42s" and editor._format_duration(60) == "1m 00s" and editor._format_duration(372.6) == "6m 13s"
+
+
+def test_prompts_explain_the_pause_markers_and_the_closing_remark():
+    assert "⏸" in editor.WINDOW_PROMPT and "continuous speech" in editor.WINDOW_PROMPT
+    assert "⏸" in editor.REVIEW_PROMPT and "closing remark" in editor.REVIEW_PROMPT
+    assert "one line too early feels cut off" in editor.REVIEW_PROMPT
+
+
+def test_window_transcripts_carry_pause_markers(monkeypatch):
+    prompts = []
+
+    def fake_create(**kwargs):
+        prompts.append(kwargs["messages"][1]["content"])
+        return _openai_reply('{"clips": []}')
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    segments = [{"start": 0.0, "end": 3.0, "text": "a."}, {"start": 5.0, "end": 8.0, "text": "b."}]
+    editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", None)
+    assert "⏸ 2.0s" in prompts[0]
+
+
+def test_process_video_finishes_a_sentence_the_ai_cut_in_half(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips"), "review_boundaries": False},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    segments = [{"start": 100.0, "end": 124.0, "text": "долгое начало без точки"}, {"start": 124.0, "end": 129.0, "text": "Нет, смотри, короче, первый, это"},
+                {"start": 129.9, "end": 134.0, "text": "первая лампочка."}, {"start": 200.0, "end": 205.0, "text": "Другое."}]
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", lambda *a, **k: segments)
+    monkeypatch.setattr("src.core.editor._generate_clips_with_llm", lambda *a, **k: [
+        {"start_time": 100.0, "end_time": 129.0, "virality_score": 8, "reasoning": "r"}])
+    monkeypatch.setattr("src.core.editor._snap_clips_to_pauses", lambda f, clips, _d, logger: clips)
+    seen = {}
+
+    def fake_extract(f, data, *a, **k):
+        seen["clips"] = data["clips"]
+        return ["x.mp4"]
+
+    monkeypatch.setattr("src.core.editor.extract_clips", fake_extract)
+    editor.process_video(str(video))
+    assert seen["clips"][0]["end_time"] == 134.0

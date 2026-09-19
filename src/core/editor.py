@@ -792,7 +792,8 @@ WINDOW_PROMPT = (
     "{overlap_note}"
     "Line format: [start - end] optional audio tags, then speech. [LOUDNESS: X%] = how far the line rises above the local background level "
     "(shown only when notable); [ACTION: COMBAT] = sharp gunshot/explosion transients; standalone lines such as [LAUGHTER 80%], [SCREAM 90%] or [LOUD 60%] "
-    "were detected in the raw audio (LAUGHTER/SCREAM by a pretrained sound classifier, the percentage is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
+    "were detected in the raw audio; a '⏸ 1.2s' line is a real silence between two lines (lines without one are continuous speech: never start or end a clip inside continuous speech). "
+    "(LAUGHTER/SCREAM by a pretrained sound classifier, the percentage is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
     "Return {want} candidate highlights: the {want} best distinct moments of this section, best first. Your job here is to RANK, not to gatekeep - "
     "a later step compares the candidates of all sections on one scale and drops the weak ones, but it can only choose from what you nominate. "
     "If the section has fewer real highlights, fill the remaining slots with the best of the rest and give them the low score they deserve; "
@@ -1011,7 +1012,7 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
     def nominate(item: Any) -> Optional[List[Dict[str, Any]]]:
         idx, window = item
         request_start = time.monotonic()
-        transcript = "".join(highlights.format_entry(e) for e in window["lines"])
+        transcript = highlights.format_transcript(window["lines"])
         overlap_note = ""
         if len(windows) > 1:
             overlap_note = (f"Only nominate moments whose peak lies inside this section; the first and last {highlights.WINDOW_OVERLAP:.0f}s overlap the "
@@ -1102,7 +1103,8 @@ REVIEW_SYSTEM = (
 REVIEW_PROMPT = (
     "Below is a transcript excerpt of a gaming stream ({lo:.0f}s - {hi:.0f}s). A highlight clip was proposed from {start:.1f}s to {end:.1f}s "
     "(lines inside it are marked with '>'). All times are absolute seconds. Line format: [start - end] tags and speech; standalone "
-    "[LAUGHTER n%] / [SCREAM n%] / [LOUD n%] lines come from an audio classifier.\n\n"
+    "[LAUGHTER n%] / [SCREAM n%] / [LOUD n%] lines come from an audio classifier; a '⏸ 1.2s' line is a real silence between two lines, so lines with NO "
+    "⏸ between them are continuous speech - starting or ending a clip there cuts a sentence or a reaction in half.\n\n"
     "STEP 1 - split the WHOLE excerpt into consecutive scenes. A new scene starts whenever the subject of the conversation changes "
     "(a different joke, a different puzzle or game object, a different question, moving from banter to giving instructions, and so on). "
     "For every scene give start_time and end_time (only values printed on the lines), a short topic, and 'humor' 0-10 = how funny or entertaining it is "
@@ -1113,6 +1115,8 @@ REVIEW_PROMPT = (
     "panel or task, moving on to the next step) is never part of the clip, even when it follows the payoff directly. Never include filler, or scenes that "
     "merely coordinate the game. A punchline without its setup is not a clip: the range must let a stranger understand who is talking to whom and what "
     "event, question or line is being reacted to (an insult, a scream or a 'wow' needs the thing that caused it, usually the 10-30 seconds before it). "
+    "The clip must also END after the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): "
+    "ending one line too early feels cut off. Prefer to start and end right next to a ⏸ pause. "
     "Only after that is satisfied, keep the range as tight as possible. A clip longer than 120 seconds must be entertaining throughout: if it contains "
     "slow or purely coordinating stretches, keep only the best continuous stretch.{short_note}\n\n"
     "Return strictly valid JSON: {{\"scenes\": [{{\"start_time\": <float>, \"end_time\": <float>, \"topic\": \"...\", \"humor\": <int>}}, ...], "
@@ -1169,8 +1173,8 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
     def review_one(item: Any) -> Optional[Dict[str, Any]]:
         i, clip = item
         lo, hi = clip["start_time"] - REVIEW_CONTEXT, clip["end_time"] + REVIEW_CONTEXT
-        excerpt = "".join(("> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ") + highlights.format_entry(e)
-                          for e in entries if e["end"] > lo and e["start"] < hi)
+        excerpt = highlights.format_transcript([e for e in entries if e["end"] > lo and e["start"] < hi],
+                                               lambda e: "> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ")
         length = clip["end_time"] - clip["start_time"]
         short_note = (f" NOTE: this clip is only {length:.0f} seconds long. Clips that short are almost always missing the situation that makes "
                       "the punchline understandable: unless it is a complete joke on its own, start EARLIER and include the scene(s) that set it up."
@@ -1298,7 +1302,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
     if all_clips:
         stage("✂️", "Cutting & exporting")
     all_clips = [highlights.extend_short_clip(clip, entries) for clip in all_clips]
-    all_clips = [highlights.limit_length(highlights.refine_clip(clip, entries, duration)) for clip in all_clips]
+    all_clips = [highlights.limit_length(highlights.complete_thoughts(highlights.refine_clip(clip, entries, duration), entries)) for clip in all_clips]
     all_clips = highlights.resolve_overlaps(_snap_clips_to_pauses(file_path, all_clips, duration, logger))
     if is_cancelled and is_cancelled(): return False
     if logger and all_clips:

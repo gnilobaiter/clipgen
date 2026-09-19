@@ -37,6 +37,7 @@ def test_get_default_config():
     assert "virality_score" in default_prompt
     assert "WHAT MAKES A GOOD CLIP RANGE" in default_prompt and "there is no target" in default_prompt
     assert "ONE moment, ONE topic" in default_prompt and "HOW TO MARK IT" in default_prompt
+    assert "⏸" in default_prompt and "closing remark" in default_prompt  # pauses are shown to the AI, endings include the tag line
     assert "cut shorter" not in default_prompt  # "when in doubt, cut shorter" produced clips without their setup
     assert config["settings"]["review_boundaries"] is True
     # the old numeric "typical" ranges and the 90 s cap used to be read by the model as a length to aim for

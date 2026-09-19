@@ -247,3 +247,86 @@ def test_select_clips_reports_why_candidates_were_dropped():
     unlimited = {}
     hl.select_clips(cands, duration=3600, clips_per_hour=0, min_score=6, stats=unlimited)
     assert unlimited["limit"] == -1 and unlimited["over_limit"] == 0
+
+
+# --------------------------- finishing the thought (real cases from the test video) ---------------------------
+def _u(start, end, text, **extra):
+    return {"start": start, "end": end, "text": text, **extra}
+
+
+def _cut(start, end, **extra):
+    return {"start_time": start, "end_time": end, "virality_score": 8, "reasoning": "r", **extra}
+
+
+def test_hesitation_pause_in_the_middle_of_a_sentence_does_not_end_the_clip():
+    """Clip 15: the clip stopped after "..., это" and the sentence went on 0.9 s later."""
+    entries = [_u(3240.0, 3246.9, "Нет, смотри, короче, первый, это"), _u(3247.8, 3252.0, "первая лампочка, то есть имеется в виду не загоревшаяся."),
+               _u(3260.0, 3262.0, "Совсем другая тема.")]
+    out = hl.complete_thoughts(_cut(3226.0, 3246.9), entries)
+    assert out["end_time"] == pytest.approx(3252.0)  # the sentence is finished, the next topic is not touched
+
+
+def test_closing_remark_after_the_punchline_is_included_as_an_opening_of_the_next_line():
+    """Clip 10: "...А пенис выше, типа наверх." is followed after 0.5 s by "все логично же по сути" + a new topic in ONE long line."""
+    entries = [_u(2322.3, 2325.1, "А пенис выше, типа наверх."),
+               _u(2325.6, 2336.4, "все логично же по сути открываем смотри 1 у нас тут пола этот не ползунки у нас")]
+    out = hl.complete_thoughts(_cut(2282.0, 2325.1), entries)
+    assert out["end_time"] == pytest.approx(2325.6 + hl.PARTIAL_TAIL_SECONDS)  # only the opening of the long line
+    assert out["end_time"] < 2336.4
+
+
+def test_short_reaction_after_a_finished_sentence_is_included_but_a_new_topic_after_a_pause_is_not():
+    """Clip 16 vs clip 7."""
+    reaction = [_u(3826.4, 3830.8, "Их две, их два песочных часа, одни закруглые, одни треугольные."), _u(3831.8, 3832.2, "Ааа."),
+                _u(3832.7, 3834.7, "Я же говорю, треугольники с вершинами."), _u(3834.9, 3840.8, "Я их не понял. Бля, это пиздец, сука. Это еще")]
+    out = hl.complete_thoughts(_cut(3775.0, 3830.8), reaction)
+    assert 3834.7 <= out["end_time"] <= 3834.9 + hl.PARTIAL_TAIL_SECONDS + 1e-6
+
+    topic_change = [_u(1607.8, 1609.0, "Так я и говорю, что 4."), _u(1609.1, 1609.3, "Да, да."), _u(1610.4, 1612.5, "А кто сказал 57-34?")]
+    assert hl.complete_thoughts(_cut(1554.0, 1609.3), topic_change)["end_time"] == 1609.3  # a 1.1 s pause and a new subject: leave it
+
+
+def test_clip_that_stops_inside_a_line_finishes_that_line_within_the_limit():
+    entries = [_u(100.0, 108.0, "Я только по шрифту этого вижу кнопки числа."), _u(120.0, 125.0, "А потом ещё")]
+    assert hl.complete_thoughts(_cut(50.0, 104.0), entries)["end_time"] == 108.0
+    assert hl.complete_thoughts(_cut(50.0, 101.0), [_u(100.0, 160.0, "очень длинная реплика")])["end_time"] == 101.0  # too far to finish
+
+
+def test_tail_extension_is_bounded_even_in_endless_chatter():
+    entries = [_u(100.0 + i * 3.0, 102.9 + i * 3.0, f"часть {i}") for i in range(12)]  # gapless, no sentence ends
+    out = hl.complete_thoughts(_cut(50.0, 102.9), entries)
+    assert out["end_time"] - 102.9 <= hl.MAX_TAIL_EXTENSION + 1e-6
+
+
+def test_start_in_the_middle_of_a_sentence_moves_back_only_when_the_previous_line_is_unfinished_and_adjacent():
+    open_prev = [_u(92.0, 95.0, "один только загорелся дальше цифра какая"), _u(95.5, 99.0, "5 цифра 5 и зеленый")]
+    assert hl.complete_thoughts(_cut(95.5, 130.0), open_prev)["start_time"] == 92.0
+    finished_prev = [_u(90.0, 95.0, "А как?"), _u(95.5, 99.0, "я смотрю но мне показывают")]
+    assert hl.complete_thoughts(_cut(95.5, 130.0), finished_prev)["start_time"] == 95.5  # a new sentence starts here
+    far_prev = [_u(80.0, 90.0, "что-то без точки"), _u(95.5, 99.0, "новая мысль")]
+    assert hl.complete_thoughts(_cut(95.5, 130.0), far_prev)["start_time"] == 95.5  # a real pause between them
+    too_far = [_u(60.0, 95.3, "очень длинная реплика без точки"), _u(95.5, 99.0, "продолжение")]
+    assert hl.complete_thoughts(_cut(95.5, 130.0), too_far)["start_time"] == 95.5  # would add more than MAX_HEAD_EXTENSION
+
+
+def test_complete_thoughts_leaves_clips_alone_without_speech_and_never_mutates_input():
+    clip = _cut(10.0, 20.0)
+    assert hl.complete_thoughts(clip, []) is clip
+    assert hl.complete_thoughts(clip, [{"start": 12.0, "end": 14.0, "text": "", "event": "LAUGHTER"}]) is clip
+    entries = [_u(19.0, 20.0, "и вот")]
+    hl.complete_thoughts(clip, entries + [_u(20.5, 21.0, "да")])
+    assert clip["end_time"] == 20.0
+
+
+# --------------------------- pause markers in the transcript shown to the AI ---------------------------
+def test_transcript_shows_real_pauses_and_none_inside_continuous_speech():
+    lines = [_u(0.0, 3.0, "первая"), _u(3.3, 5.0, "вторая без паузы"), _u(6.5, 8.0, "третья после паузы"),
+             {"start": 8.2, "end": 9.0, "text": "", "event": "LAUGHTER", "strength": 60}, _u(12.0, 13.0, "четвёртая")]
+    text = hl.format_transcript(lines)
+    assert "⏸ 1.5s" in text and "⏸ 4.0s" in text  # the gap to the line after the laugh is measured from the last speech end
+    assert text.count("⏸") == 2  # the 0.3 s gap between the first two lines is not a pause
+    assert text.index("вторая без паузы") < text.index("⏸ 1.5s") < text.index("третья после паузы")
+    assert "[LAUGHTER 60%]" in text
+    marked = hl.format_transcript(lines, lambda e: "> " if e["start"] < 6 else "  ")
+    assert marked.startswith("> [0.0s - 3.0s]") and "  ⏸ 1.5s" in marked
+    assert hl.format_transcript([]) == ""
