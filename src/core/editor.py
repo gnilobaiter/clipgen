@@ -7,7 +7,7 @@ import re
 import subprocess
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -225,6 +225,10 @@ def _calculate_crop_filter(_aspect_ratio_str: str, mode: str, custom_x: str, cus
 
     return f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale=1080:1920"
 
+AUDIO_FADE_IN = 0.04
+AUDIO_FADE_OUT = 0.15
+
+
 def extract_clips(input_file: str, clips_data: Dict[str, Any], output_dir: str, logger: Optional[Callable[[str], None]] = None, is_cancelled: Optional[Callable[[], bool]] = None) -> List[str]:
     """Cuts clips via FFmpeg based on AI timestamps."""
     if not os.path.isfile(input_file):
@@ -338,16 +342,18 @@ def extract_clips(input_file: str, clips_data: Dict[str, Any], output_dir: str, 
             cmd.extend(["-vf", final_filter_str])
 
         # Audio: merge multiple streams via filter_complex, or just copy/encode
+        # a short fade in/out keeps a cut from sounding chopped when the last syllable is soft (no fade when audio is copied)
+        fade = f"afade=t=in:st=0:d={AUDIO_FADE_IN},afade=t=out:st={max(0.0, duration - AUDIO_FADE_OUT):.3f}:d={AUDIO_FADE_OUT}"
         if use_amix:
             filter_parts = []
             for idx in range(num_audio):
                 filter_parts.append(f"[0:a:{idx}]")
-            amix_filter = "".join(filter_parts) + f"amix=inputs={num_audio}:duration=longest:normalize=0[aout]"
+            amix_filter = "".join(filter_parts) + f"amix=inputs={num_audio}:duration=longest:normalize=0[amixed];[amixed]{fade}[aout]"
             cmd.extend(["-filter_complex", amix_filter, "-map", "0:v", "-map", "[aout]"])
             cmd.extend(["-c:a", "aac", "-b:a", "192k"])
         elif downmix_audio:
             # Single audio stream — just encode to AAC (no broken pan filter)
-            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            cmd.extend(["-af", fade, "-c:a", "aac", "-b:a", "192k"])
         else:
             cmd.extend(["-c:a", "copy"])
 
@@ -966,7 +972,7 @@ def _rerank_candidates(route: _LLMRoute, candidates: List[Dict[str, Any]], segme
     )
     prompt = RERANK_PROMPT.format(count=len(candidates), minutes=duration / 60.0, items=items)
     started = time.monotonic()
-    answer = list(_run_batches([0], lambda _n: _request_json(route, RERANK_SYSTEM, prompt, _parse_json_scores, logger, "re-ranking", extra_body_enabled),
+    answer = list(_run_parallel([0], lambda _n: _request_json(route, RERANK_SYSTEM, prompt, _parse_json_scores, logger, "re-ranking", extra_body_enabled),
                                1, is_cancelled,
                                lambda _b, _d, _t: logger(f"⏳ {route.engine_name} is still thinking... re-ranking ({time.monotonic() - started:.0f}s)") if logger else None))
     scores = answer[0][1] if answer else None
@@ -1033,7 +1039,7 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
 
     candidates: List[Dict[str, Any]] = []
     consecutive_failures = 0
-    for (idx, _window), found in _run_batches(list(enumerate(windows, start=1)), nominate, workers, is_cancelled, waiting):
+    for (idx, _window), found in _run_parallel(list(enumerate(windows, start=1)), nominate, workers, is_cancelled, waiting):
         consecutive_failures = consecutive_failures + 1 if found is None else 0
         if found:
             candidates.extend(found)
@@ -1051,49 +1057,67 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
     return candidates
 
 
-LLM_WORKERS = 4  # parallel requests when the reasoning mode makes each one slow
+LLM_WORKERS = 6  # parallel requests when the reasoning mode makes each one slow
 
 
+_NO_MORE = object()
 HEARTBEAT_SECONDS = 20.0  # "still thinking" is logged after this many seconds without any answer
 CANCEL_POLL_SECONDS = 0.5
 
 
-def _run_batches(items: List[Any], worker: Callable[[Any], Any], workers: int, is_cancelled: Optional[Callable[[], bool]],
-                 heartbeat: Optional[Callable[[float, int, int], None]] = None):
-    """Yields (item, result) in order, running `worker` on `workers` items at a time in threads.
+def _run_parallel(items: List[Any], worker: Callable[[Any], Any], workers: int, is_cancelled: Optional[Callable[[], bool]],
+                  heartbeat: Optional[Callable[[float, int, int], None]] = None):
+    """Yields (item, result) as each finishes, keeping `workers` requests in flight: a new one starts the moment another
+    finishes AND the consumer has handled that result (lock-step batches used to wait for the slowest request of every
+    batch; submitting everything at once would let requests start after the consumer decided to stop).
 
-    While a batch is in flight this polls the cancel flag twice a second and returns at once when cancelled (the
-    HTTP requests already sent cannot be interrupted and simply finish in the background), and calls
-    `heartbeat(seconds_in_batch, items_done, items_total)` after HEARTBEAT_SECONDS of silence so a slow reasoning
-    model does not look frozen. The consumer may also stop early by breaking out of the loop."""
-    total, done_total = len(items), 0
-    for i in range(0, total, max(1, workers)):
-        if is_cancelled and is_cancelled():
-            return
-        batch = items[i:i + max(1, workers)]
-        pool = ThreadPoolExecutor(max_workers=len(batch))
-        futures = [pool.submit(worker, item) for item in batch]
-        pending = set(futures)
-        started = last_beat = time.monotonic()
-        while pending:
-            done_now, pending = wait(pending, timeout=min(CANCEL_POLL_SECONDS, HEARTBEAT_SECONDS))
+    While waiting it polls the cancel flag twice a second and returns at once when cancelled (requests already sent
+    cannot be interrupted and finish in the background), and calls `heartbeat(seconds, items_done, items_total)` after
+    HEARTBEAT_SECONDS without any answer so a slow reasoning model does not look frozen."""
+    total = len(items)
+    if not total or (is_cancelled and is_cancelled()):
+        return
+    pool = ThreadPoolExecutor(max_workers=max(1, min(workers, total)))
+    queue = iter(items)
+    in_flight: Dict[Any, Any] = {}
+    submitted = 0
+    done_total = 0
+    started = last_beat = time.monotonic()
+
+    def fill() -> None:
+        nonlocal submitted
+        while len(in_flight) < max(1, workers):
+            item = next(queue, _NO_MORE)
+            if item is _NO_MORE:
+                return
+            in_flight[pool.submit(worker, item)] = (submitted, item)
+            submitted += 1
+
+    try:
+        fill()
+        while in_flight:
+            done_now, _pending = wait(list(in_flight), timeout=min(CANCEL_POLL_SECONDS, HEARTBEAT_SECONDS), return_when=FIRST_COMPLETED)
             if is_cancelled and is_cancelled():
-                pool.shutdown(wait=False, cancel_futures=True)
                 return
             now = time.monotonic()
-            if done_now:  # an answer just arrived (and was logged): that is progress, stay quiet
+            if done_now:  # an answer just arrived (and is about to be logged): that is progress, stay quiet
                 last_beat = now
-            if pending and heartbeat and now - last_beat >= HEARTBEAT_SECONDS:
-                heartbeat(now - started, done_total + len(batch) - len(pending), total)
+            for future in sorted(done_now, key=lambda f: in_flight[f][0]):  # answers that arrived together: in submission order
+                _order, item = in_flight.pop(future)
+                done_total += 1
+                yield item, future.result()
+                fill()  # only now, after the consumer has seen the result and (maybe) decided to stop
+            if in_flight and not done_now and heartbeat and now - last_beat >= HEARTBEAT_SECONDS:
+                heartbeat(now - started, done_total, total)
                 last_beat = now
-        pool.shutdown(wait=True)
-        results = [f.result() for f in futures]
-        done_total += len(batch)
-        yield from zip(batch, results)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 REVIEW_CONTEXT = 45.0
 MAX_REVIEW_FAILURES = 2
+MAX_REVIEW_HEAD_GROWTH = 20.0  # the review may add at most this much setup before a clip...
+MAX_REVIEW_TAIL_GROWTH = 12.0  # ...and this much after it (unbounded, it added 25+ s to most clips)
 
 REVIEW_SYSTEM = (
     "You are a precise video editor. You split a stream excerpt into scenes and pick the one self-contained clip range in it. "
@@ -1114,7 +1138,7 @@ REVIEW_PROMPT = (
     "question, the running gag), plus the immediate reaction ONLY when it is about the same subject. A scene that starts a new subject (noticing a new device, "
     "panel or task, moving on to the next step) is never part of the clip, even when it follows the payoff directly. Never include filler, or scenes that "
     "merely coordinate the game. A punchline without its setup is not a clip: the range must let a stranger understand who is talking to whom and what "
-    "event, question or line is being reacted to (an insult, a scream or a 'wow' needs the thing that caused it, usually the 10-30 seconds before it). "
+    "event, question or line is being reacted to (an insult, a scream or a 'wow' needs the thing that caused it). Add a preceding scene ONLY if the punchline would be unintelligible without it: delete it in your mind - does a stranger still get the joke? Then it is not needed. Game rules, earlier attempts and earlier jokes are background, not setup; a single trigger line or one short setup scene is usually enough. "
     "The clip must also END after the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): "
     "ending one line too early feels cut off. Prefer to start and end right next to a ⏸ pause. "
     "Only after that is satisfied, keep the range as tight as possible. A clip longer than 120 seconds must be entertaining throughout: if it contains "
@@ -1138,6 +1162,12 @@ def _parse_review(raw_text: Any) -> Optional[Dict[str, Any]]:
         return None
     return {"start_time": scenes[first]["start_time"], "end_time": scenes[last]["end_time"],
             "reason": str(data.get("reason", "")).strip(), "scenes": len(scenes)}
+
+
+def _limit_review_growth(clip: Dict[str, Any], review: Dict[str, Any]) -> Dict[str, Any]:
+    """Caps how much setup / tail a review may add (shrinking is left to _accept_review)."""
+    return dict(review, start_time=max(review["start_time"], clip["start_time"] - MAX_REVIEW_HEAD_GROWTH),
+                end_time=min(review["end_time"], clip["end_time"] + MAX_REVIEW_TAIL_GROWTH))
 
 
 def _accept_review(clip: Dict[str, Any], review: Dict[str, Any], duration: float) -> bool:
@@ -1178,32 +1208,33 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
         length = clip["end_time"] - clip["start_time"]
         short_note = (f" NOTE: this clip is only {length:.0f} seconds long. Clips that short are almost always missing the situation that makes "
                       "the punchline understandable: unless it is a complete joke on its own, start EARLIER and include the scene(s) that set it up."
-                      if length < 2 * highlights.MIN_CONTEXT_SECONDS else "")
+                      if length < highlights.MIN_CONTEXT_SECONDS else "")
         prompt = REVIEW_PROMPT.format(lo=lo, hi=hi, start=clip["start_time"], end=clip["end_time"], excerpt=excerpt, short_note=short_note)
         return _request_json(route, REVIEW_SYSTEM, prompt, _parse_review, logger, f"boundary review {i}/{len(clips)}", extra_body_enabled)
 
     def waiting(_batch_seconds: float, done: int, total: int) -> None:
         if logger: logger(f"⏳ {route.engine_name} is still thinking... {done}/{total} clips reviewed ({time.monotonic() - stage_start:.0f}s)")
 
-    reviewed: List[Dict[str, Any]] = []
+    results: Dict[int, Dict[str, Any]] = {}
     failures = changed = 0
-    for (i, clip), review in _run_batches(list(enumerate(clips, start=1)), review_one, workers, is_cancelled, waiting):
+    for (i, clip), review in _run_parallel(list(enumerate(clips, start=1)), review_one, workers, is_cancelled, waiting):
         if review is None:
             failures += 1
         else:
             failures = 0
+            review = _limit_review_growth(clip, review)
             if _accept_review(clip, review, duration) and (abs(review["start_time"] - clip["start_time"]) > 0.5 or abs(review["end_time"] - clip["end_time"]) > 0.5):
                 changed += 1
                 if logger: logger(f"🔍 Clip {i}: {clip['start_time']:.0f}-{clip['end_time']:.0f}s -> {review['start_time']:.0f}-{review['end_time']:.0f}s ({review['reason'][:70]})")
                 clip = dict(clip, start_time=round(review["start_time"], 2), end_time=round(review["end_time"], 2))
-        reviewed.append(clip)
+        results[i] = clip
         if failures >= MAX_REVIEW_FAILURES:
             if logger: logger("⚠️ The boundary review keeps failing - keeping the remaining clips as they are.")
             break
     if is_cancelled and is_cancelled():
         if logger: logger("🛑 Cancelled - not waiting for the remaining AI answers.")
         return clips
-    reviewed.extend(clips[len(reviewed):])
+    reviewed = [results.get(i, clip) for i, clip in enumerate(clips, start=1)]  # original order, whatever finished first
     if logger: logger(f"🔍 Boundary review: {changed} of {len(clips)} clip(s) adjusted, the rest were already right.")
     return reviewed
 

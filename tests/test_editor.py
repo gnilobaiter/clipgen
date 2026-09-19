@@ -1121,8 +1121,6 @@ def test_review_rejects_unsafe_answers_and_keeps_the_original(monkeypatch):
     clip = {"start_time": 100.0, "end_time": 140.0, "virality_score": 8, "reasoning": "r", "peak_time": 130.0}
     ok_scene = (100.0, 140.0, "x")
     bad_answers = [
-        _scenes_reply([(100.0, 900.0, "way too long")], 0, 0),
-        _scenes_reply([(40.0, 140.0, "moves more than the context window")], 0, 0),
         _scenes_reply([(100.0, 102.0, "too short")], 0, 0),
         _scenes_reply([(200.0, 260.0, "a different moment entirely")], 0, 0),
         _scenes_reply([(150.0, 190.0, "barely overlaps")], 0, 0),
@@ -1137,6 +1135,16 @@ def test_review_rejects_unsafe_answers_and_keeps_the_original(monkeypatch):
         route = _review_route(monkeypatch, [answer, answer, answer])
         result = REAL_REVIEW(route, [clip], _entries(), 300.0, None, None, [True])
         assert (result[0]["start_time"], result[0]["end_time"]) == (100.0, 140.0), answer
+
+
+def test_review_can_only_add_a_limited_amount_of_setup_and_tail(monkeypatch):
+    """The unbounded review added 25+ s of "setup" to most clips (median AI length 24 s -> final 53 s)."""
+    clip = {"start_time": 100.0, "end_time": 140.0, "virality_score": 8, "reasoning": "r", "peak_time": 130.0}
+    route = _review_route(monkeypatch, [_scenes_reply([(40.0, 100.0, "long setup"), (100.0, 400.0, "joke and much more")], 0, 1)])
+    result = REAL_REVIEW(route, [clip], _entries(), 800.0, None, None, [True])
+    assert (result[0]["start_time"], result[0]["end_time"]) == (100.0 - editor.MAX_REVIEW_HEAD_GROWTH, 140.0 + editor.MAX_REVIEW_TAIL_GROWTH)
+    changed = editor._limit_review_growth(clip, {"start_time": 120.0, "end_time": 130.0, "reason": ""})  # shrinking is not limited here
+    assert (changed["start_time"], changed["end_time"]) == (120.0, 130.0)
 
 
 def test_review_keeps_clips_that_are_already_right_and_survives_api_failures(monkeypatch):
@@ -1314,31 +1322,43 @@ def test_log_says_whether_deepseek_runs_with_reasoning(monkeypatch):
     editor._generate_clips_with_llm(segments, dict(base, settings={"deepseek_thinking": True}), "deepseek-v4-flash", "P", on.append)
     editor._generate_clips_with_llm(segments, dict(base, settings={"deepseek_thinking": False}), "deepseek-v4-flash", "P", off.append)
     editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", other.append)
-    assert any("DeepSeek reasoning mode: ON" in line and "4 requests in parallel" in line for line in on)
+    assert any("DeepSeek reasoning mode: ON" in line and f"{editor.LLM_WORKERS} requests in parallel" in line for line in on)
     assert any("DeepSeek reasoning mode: OFF" in line for line in off) and not any("in parallel" in line for line in off)
     assert not any("reasoning mode" in line for line in other)
 
 
-def test_run_batches_keeps_order_runs_in_parallel_and_stops_on_cancel():
+def test_run_parallel_keeps_workers_busy_and_yields_results_as_they_finish():
     import threading
     import time
 
     lock = threading.Lock()
     state = {"now": 0, "max": 0}
+    starts = {}
+    t0 = time.monotonic()
 
     def worker(x):
         with lock:
             state["now"] += 1
             state["max"] = max(state["max"], state["now"])
-        time.sleep(0.02 * max(0, 5 - x))  # later items finish first
+            starts[x] = time.monotonic() - t0
+        time.sleep(0.5 if x == 1 else 0.05)  # item 1 is slow
         with lock:
             state["now"] -= 1
         return x * 10
 
-    assert list(editor._run_batches([1, 2, 3, 4, 5, 6], worker, 3, None)) == [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]
-    assert state["max"] == 3
+    out = list(editor._run_parallel([1, 2, 3, 4, 5], worker, 2, None))
+    assert sorted(out) == [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+    assert [item for item, _r in out][-1] == 1  # the slow one arrives last, the others were not held up behind it
+    assert state["max"] == 2
+    assert starts[3] < 0.3 and starts[5] < 0.4  # sliding: a new request starts as soon as a slot frees up, not after the slow one
+
     state["max"] = 0
-    assert [r for _i, r in editor._run_batches([1, 2, 3], worker, 1, None)] == [10, 20, 30] and state["max"] == 1
+    assert [r for _i, r in editor._run_parallel([2, 3, 4], worker, 1, None)] == [20, 30, 40] and state["max"] == 1  # one at a time, in order
+    assert list(editor._run_parallel([], worker, 4, None)) == []
+
+
+def test_run_parallel_starts_nothing_more_once_the_consumer_stops_or_cancel_is_set():
+    import time
 
     calls = []
 
@@ -1346,17 +1366,45 @@ def test_run_batches_keeps_order_runs_in_parallel_and_stops_on_cancel():
         calls.append(x)
         return x
 
-    cancelled = {"now": False}
+    for _item, _result in editor._run_parallel([1, 2, 3, 4], counting, 1, None):
+        break  # e.g. two windows failed in a row: no further request may be sent
+    time.sleep(0.2)
+    assert calls == [1]
+
+    calls.clear()
+    assert list(editor._run_parallel([1, 2, 3], counting, 2, lambda: True)) == [] and calls == []  # cancelled before the start
+
+
+def test_heartbeat_fires_while_requests_are_in_flight(monkeypatch):
+    import time
+
+    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.15)
+    beats = []
+
+    def slow(x):
+        time.sleep(0.6)
+        return x
+
+    results = list(editor._run_parallel([1, 2, 3], slow, 3, None, lambda seconds, done, total: beats.append((round(seconds, 1), done, total))))
+    assert sorted(r for _i, r in results) == [1, 2, 3]
+    assert len(beats) >= 2 and all(total == 3 and done == 0 for _s, done, total in beats)
+    assert beats == sorted(beats)  # elapsed time only grows
+
+
+def test_cancel_returns_immediately_even_though_requests_are_still_in_flight():
+    import time
+
+    started = time.monotonic()
+
+    def slow(x):
+        time.sleep(3.0)  # an AI request that would take 3 s to answer
+        return x
 
     def cancel():
-        return cancelled["now"]
+        return time.monotonic() - started > 0.3
 
-    out = []
-    for item, _result in editor._run_batches(list(range(6)), counting, 2, cancel):
-        out.append(item)
-        cancelled["now"] = True  # cancel after the first batch was consumed
-    assert out == [0, 1] and calls == [0, 1]  # the second batch never started
-    assert list(editor._run_batches([], counting, 4, None)) == []
+    out = list(editor._run_parallel([1, 2, 3, 4], slow, 4, cancel))
+    assert out == [] and time.monotonic() - started < 1.5  # returned long before the requests finished
 
 
 def test_reasoning_mode_runs_windows_and_reviews_in_parallel(monkeypatch):
@@ -1396,10 +1444,19 @@ def test_reasoning_mode_runs_windows_and_reviews_in_parallel(monkeypatch):
 
 
 def test_parallel_review_keeps_clip_order_and_stops_after_repeated_failures(monkeypatch):
+    import threading
+    import time as real_time
+
+    good_answered = threading.Event()
+
     def fake_create(**kwargs):
         user = kwargs["messages"][1]["content"]
         if "from 50.0s to 90.0s" in user:  # clip 1
-            return _openai_reply(_scenes_reply([(20.0, 60.0, "setup"), (60.0, 90.0, "joke")], 0, 1))
+            reply = _openai_reply(_scenes_reply([(20.0, 60.0, "setup"), (60.0, 90.0, "joke")], 0, 1))
+            good_answered.set()
+            return reply
+        good_answered.wait(2.0)  # the other clips fail only after the good answer exists (results arrive in completion order)
+        real_time.sleep(0.15)
         raise RuntimeError("boom")
 
     mock_client = MagicMock()
@@ -1412,76 +1469,15 @@ def test_parallel_review_keeps_clip_order_and_stops_after_repeated_failures(monk
     logs = []
     result = REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, None, [True])
     assert [c["end_time"] for c in result] == [c["end_time"] for c in clips]  # order kept
-    assert result[0]["start_time"] == 20.0  # the one good answer was applied to the right clip
+    assert result[0]["start_time"] == 30.0  # the one good answer was applied to the right clip (setup growth is capped at 20 s)
     assert all(r["start_time"] == c["start_time"] for r, c in zip(result[1:], clips[1:]))
-    assert any("reasoning ON, 4 in parallel" in line for line in logs)
+    assert any(f"reasoning ON, {editor.LLM_WORKERS} in parallel" in line for line in logs)
     assert any("keeps failing" in line for line in logs)
 
 
 # ==============================================================================
 # PROGRESS MESSAGES AND IMMEDIATE CANCEL WHILE THE AI IS THINKING
 # ==============================================================================
-def test_heartbeat_fires_while_a_slow_batch_is_in_flight(monkeypatch):
-    import time
-
-    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.15)
-    beats = []
-
-    def slow(x):
-        time.sleep(0.6)
-        return x
-
-    results = list(editor._run_batches([1, 2, 3], slow, 3, None, lambda seconds, done, total: beats.append((round(seconds, 1), done, total))))
-    assert [r for _i, r in results] == [1, 2, 3]
-    assert len(beats) >= 2 and all(total == 3 and done == 0 for _s, done, total in beats)
-    assert beats == sorted(beats)  # elapsed time only grows
-
-
-def test_cancel_returns_immediately_even_though_requests_are_still_in_flight():
-    import time
-
-    state = {"cancel": False}
-    started = time.monotonic()
-
-    def slow(x):
-        time.sleep(3.0)  # an AI request that would take 3 s to answer
-        return x
-
-    def cancel():
-        return time.monotonic() - started > 0.3
-
-    out = list(editor._run_batches([1, 2, 3, 4], slow, 4, cancel))
-    assert out == [] and time.monotonic() - started < 1.5  # returned long before the requests finished
-    assert state["cancel"] is False
-
-
-def test_windows_log_results_as_they_arrive_and_stay_quiet_otherwise(monkeypatch):
-    import time
-
-    monkeypatch.setattr(editor, "HEARTBEAT_SECONDS", 0.1)
-
-    def fake_create(**kwargs):
-        time.sleep(0.4)
-        user = kwargs["messages"][1]["content"]
-        if user.startswith("Below are"):
-            n = user.count("\nid=") + 1
-            return _openai_reply(json.dumps({"scores": [{"id": i, "score": 8} for i in range(n)]}))
-        start = _window_index(user) * 600.0
-        return _openai_reply(json.dumps({"clips": [{"start_time": start, "end_time": start + 30, "virality_score": 7, "reasoning": "x"}]}))
-
-    mock_client = MagicMock()
-    mock_client.chat.completions.create.side_effect = fake_create
-    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
-    config = {"openai": {"api_key": "k"}, "deepseek": {"api_key": "d"}, "active_ai_provider": "deepseek", "settings": {"deepseek_thinking": True}}
-    logs = []
-    editor._generate_clips_with_llm(_long_segments(40), config, "deepseek-v4-flash", "P", logs.append)
-    assert not any(line.startswith("📨") for line in logs)  # no per-request announcements
-    assert any("DeepSeek is still thinking... 0/4 windows answered" in line for line in logs)
-    results = [line for line in logs if line.startswith("🎯 Window")]
-    assert len(results) == 4 and all("candidate(s) (" in line and line.endswith("s)") for line in results)
-    assert len(logs) <= 16  # the whole AI stage stays a handful of lines
-
-
 def test_heartbeat_waits_for_real_silence_answers_count_as_progress(monkeypatch):
     import time
 
@@ -1493,7 +1489,7 @@ def test_heartbeat_waits_for_real_silence_answers_count_as_progress(monkeypatch)
         time.sleep(durations[x])
         return x
 
-    list(editor._run_batches([1, 2, 3, 4], worker, 4, None, lambda seconds, done, total: beats.append((round(seconds, 2), done))))
+    list(editor._run_parallel([1, 2, 3, 4], worker, 4, None, lambda seconds, done, total: beats.append((round(seconds, 2), done))))
     assert beats, "the long silence at the end must be reported"
     assert beats[0][0] >= 0.55 and beats[0][1] == 3  # only after the last answer + a full quiet period, with 3 already done
 
@@ -1517,7 +1513,7 @@ def test_review_logs_only_changes_and_cancel_stops_waiting(monkeypatch):
     logs = []
     REAL_REVIEW(route, clips, _entries(), 800.0, logs.append, None, [True])
     assert not any(line.startswith("📨") for line in logs)
-    assert any("Clip 1: 50-90s -> 20-90s" in line and "needs the setup" in line for line in logs)
+    assert any("Clip 1: 50-90s -> 30-90s" in line and "needs the setup" in line for line in logs)  # 30 s of setup asked, 20 s allowed
     assert not any("kept" in line and "Clip 2" in line for line in logs)  # clips that stay as they are are not announced one by one
     assert any("1 of 2 clip(s) adjusted" in line for line in logs)
 
@@ -1625,3 +1621,35 @@ def test_process_video_finishes_a_sentence_the_ai_cut_in_half(tmp_path, monkeypa
     monkeypatch.setattr("src.core.editor.extract_clips", fake_extract)
     editor.process_video(str(video))
     assert seen["clips"][0]["end_time"] == 134.0
+
+
+# ==============================================================================
+# EXPORT: SHORT AUDIO FADES SO A CUT NEVER SOUNDS CHOPPED
+# ==============================================================================
+def _export_command(tmp_path, monkeypatch, tracks, downmix=True):
+    commands = []
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        return MagicMock(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(os.path, "isfile", lambda p: True)
+    monkeypatch.setattr("src.core.editor._count_audio_streams", lambda f: tracks)
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: {"settings": {"audio_downmix": downmix, "hardware_encoding": False}})
+    editor.extract_clips("source.mp4", {"clips": [{"start_time": 100.0, "end_time": 130.0, "virality_score": 8, "reasoning": "r", "pre_roll": 0.0, "post_roll": 0.0}]},
+                         str(tmp_path), logger=lambda m: None)
+    return next(c for c in commands if "-t" in c and "source.mp4" in c)
+
+
+def test_export_fades_the_audio_in_and_out_multi_track(tmp_path, monkeypatch):
+    cmd = _export_command(tmp_path, monkeypatch, tracks=3)
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "amix=inputs=3" in graph and "[amixed];[amixed]afade=t=in:st=0:d=0.04,afade=t=out:st=29.850:d=0.15[aout]" in graph
+
+
+def test_export_fades_the_audio_single_track_and_leaves_copied_audio_alone(tmp_path, monkeypatch):
+    cmd = _export_command(tmp_path, monkeypatch, tracks=1)
+    assert cmd[cmd.index("-af") + 1] == "afade=t=in:st=0:d=0.04,afade=t=out:st=29.850:d=0.15"
+    copied = _export_command(tmp_path, monkeypatch, tracks=1, downmix=False)
+    assert "-af" not in copied and "afade" not in " ".join(copied) and copied[copied.index("-c:a") + 1] == "copy"

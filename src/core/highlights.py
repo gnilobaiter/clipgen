@@ -353,19 +353,35 @@ def refine_clip(clip: Dict[str, Any], segments: List[Dict[str, Any]], duration: 
     return refined
 
 
+SAME_MOMENT_OVERLAP = 0.3  # two clips overlapping by this share of the shorter one are the same moment
+
+
 def resolve_overlaps(clips: List[Dict[str, Any]], pad: float = EXPORT_PAD) -> List[Dict[str, Any]]:
-    """Refinement can push neighbouring clips into each other; keep `pad` seconds between them, trimming the earlier clip's end, or the later clip's start if that would
-    leave the earlier one too short."""
+    """Refinement (mostly the boundary review adding setup) can push neighbouring clips into each other.
+
+    Clips that overlap substantially are the same moment found twice: they are merged (higher score wins the text),
+    never cut into a long clip plus a fragment. Clips that merely touch keep `pad` seconds between them, trimming the
+    earlier clip's end, or the later clip's start if that would leave the earlier one too short."""
     ordered = sorted((dict(c) for c in clips), key=lambda c: c["start_time"])
-    for prev, nxt in zip(ordered, ordered[1:]):
-        limit = nxt["start_time"] - pad
-        if prev["end_time"] <= limit:
-            continue
-        if limit - prev["start_time"] >= MIN_CLIP_SECONDS:
-            prev["end_time"] = round(limit, 2)
-        else:
-            nxt["start_time"] = round(prev["end_time"] + pad, 2)
-    return [c for c in ordered if c["end_time"] - c["start_time"] >= MIN_CLIP_SECONDS]
+    out: List[Dict[str, Any]] = []
+    for clip in ordered:
+        if out:
+            prev = out[-1]
+            overlap = prev["end_time"] - clip["start_time"]
+            shorter = min(prev["end_time"] - prev["start_time"], clip["end_time"] - clip["start_time"])
+            union_end = max(prev["end_time"], clip["end_time"])
+            if overlap > 0 and overlap >= SAME_MOMENT_OVERLAP * shorter and union_end - prev["start_time"] <= SAFE_MAX_CLIP_SECONDS:
+                winner = prev if prev.get("virality_score", 0) >= clip.get("virality_score", 0) else clip
+                out[-1] = dict(winner, start_time=prev["start_time"], end_time=union_end)
+                continue
+            limit = clip["start_time"] - pad
+            if prev["end_time"] > limit:
+                if limit - prev["start_time"] >= MIN_CLIP_SECONDS:
+                    prev["end_time"] = round(limit, 2)
+                else:
+                    clip["start_time"] = round(prev["end_time"] + pad, 2)
+        out.append(clip)
+    return [c for c in out if c["end_time"] - c["start_time"] >= MIN_CLIP_SECONDS]
 
 
 # --------------------------------------------------------------------------------------

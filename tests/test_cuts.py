@@ -105,3 +105,17 @@ def test_snapping_never_collapses_a_clip():
 
     snapped = cuts.snap_clip(clip, get_audio, duration=6.0)
     assert snapped["end_time"] - snapped["start_time"] >= 0.5
+
+
+def test_short_dips_between_words_are_not_pauses_only_real_gaps_are():
+    """On a real VOD 28% of cuts sat in 0.1-0.2 s dips (soft syllables, gaps between words) and clipped a word."""
+    db = cuts.frame_db(_speech(3.0, WORDS))  # WORDS has 0.15 s gaps inside the phrases and one 0.6 s pause
+    lengths = [(last - first + 1) * 0.01 for first, last in cuts.find_pauses(db)]
+    assert lengths and min(lengths) >= cuts.MIN_PAUSE - 1e-9 and max(lengths) >= 0.5
+    assert cuts.MIN_PAUSE >= 0.2
+
+
+def test_a_cut_prefers_the_real_pause_over_a_nearer_word_gap():
+    audio = _speech(3.0, WORDS)
+    cut = cuts.find_cut(audio, 0.0, target=0.82, kind="end")  # right at the 0.15 s gap after the second word
+    assert cut is not None and 1.2 < cut < 1.8  # it goes to the 0.6 s pause instead of the gap

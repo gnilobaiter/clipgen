@@ -13,8 +13,8 @@ import numpy as np
 SAMPLE_RATE = 16000
 FRAME = SAMPLE_RATE // 100  # 10 ms
 SMOOTH_FRAMES = 3
-MIN_PAUSE = 0.10  # s; shorter dips are consonant closures inside words, not pauses
-REAL_PAUSE = 0.30  # s; a pause that can end a phrase (shorter ones are usually breaths inside continuing speech)
+MIN_PAUSE = 0.20  # s; shorter dips are gaps between syllables and words - on a real VOD 28% of cuts landed in such 0.1-0.2 s dips and clipped a word
+REAL_PAUSE = 0.30  # s; a pause that can end a phrase (tried first)
 QUIET_FRACTION = 0.30  # a frame is "quiet" below floor + 30% of the way up to the speech level
 MIN_CONTRAST_DB = 8.0  # windows without this much speech/quiet contrast cannot be snapped
 SEARCH_TIERS = (1.6, 3.5)  # s to look earlier than the target for a start cut / later for an end cut; wider on retry
@@ -58,11 +58,9 @@ def find_pauses(db: np.ndarray) -> List[Tuple[int, int]]:
     return pauses
 
 
-def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, reach: float = SEARCH_TIERS[0],
-             min_pause: float = MIN_PAUSE) -> Optional[float]:
-    """Absolute time of the best cut near `target` (kind = "start" or "end"), or None if no pause is nearby.
-
-    `audio` holds the samples that begin at absolute time `window_start`."""
+def choose_pause(audio: np.ndarray, window_start: float, target: float, kind: str, reach: float = SEARCH_TIERS[0],
+                 min_pause: float = MIN_PAUSE) -> Optional[Tuple[float, float, float, float]]:
+    """The best pause near `target` as (pause_start, pause_end, lo, hi) in window-relative seconds, or None."""
     pauses = find_pauses(frame_db(audio))
     if not pauses:
         return None
@@ -80,7 +78,18 @@ def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, r
             best, best_score = (p_start, p_end), score
     if best is None:
         return None
-    p_start, p_end = best
+    return best[0], best[1], lo, hi
+
+
+def find_cut(audio: np.ndarray, window_start: float, target: float, kind: str, reach: float = SEARCH_TIERS[0],
+             min_pause: float = MIN_PAUSE) -> Optional[float]:
+    """Absolute time of the best cut near `target` (kind = "start" or "end"), or None if no pause is nearby.
+
+    `audio` holds the samples that begin at absolute time `window_start`."""
+    chosen = choose_pause(audio, window_start, target, kind, reach, min_pause)
+    if chosen is None:
+        return None
+    p_start, p_end, lo, hi = chosen
     length = p_end - p_start
     cut = p_end - min(START_LEAD, length / 2) if kind == "start" else p_start + min(END_TAIL, length / 2)
     return window_start + min(max(cut, lo), hi)

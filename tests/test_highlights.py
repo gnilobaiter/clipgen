@@ -152,10 +152,21 @@ def test_resolve_overlaps_trims_earlier_clip():
 
 
 def test_resolve_overlaps_shifts_later_clip_when_earlier_would_be_too_short():
-    clips = [_clip(100, 108), _clip(101, 150)]
+    clips = [_clip(100, 105.2), _clip(105.0, 150)]  # touching, not the same moment
     a, b = hl.resolve_overlaps(clips)
-    assert a["end_time"] == 108
-    assert b["start_time"] == pytest.approx(108 + hl.EXPORT_PAD)
+    assert a["end_time"] == 105.2
+    assert b["start_time"] == pytest.approx(105.2 + hl.EXPORT_PAD)
+
+
+def test_resolve_overlaps_merges_two_clips_that_are_the_same_moment():
+    """The review widened two neighbouring clips to the same start; the result used to be a 13 s fragment plus a 66 s clip."""
+    clips = [_clip(3761.9, 3794.0, 6, reasoning="argument"), _clip(3775.0, 3841.6, 10, reasoning="yell and laughter")]
+    merged = hl.resolve_overlaps(clips)
+    assert len(merged) == 1
+    assert (merged[0]["start_time"], merged[0]["end_time"]) == (3761.9, 3841.6)
+    assert merged[0]["virality_score"] == 10 and merged[0]["reasoning"] == "yell and laughter"  # the better clip keeps its text
+    too_long = hl.resolve_overlaps([_clip(0, 200, 7), _clip(100, 300, 9)])  # a union beyond the absolute maximum is not built
+    assert len(too_long) == 2 and too_long[0]["end_time"] <= too_long[1]["start_time"]
 
 
 def test_resolve_overlaps_leaves_distant_clips_and_drops_slivers():
