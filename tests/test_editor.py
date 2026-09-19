@@ -1240,3 +1240,45 @@ def test_selection_log_explains_the_numbers(tmp_path, monkeypatch):
 
 def test_review_prompt_holds_long_clips_to_a_stricter_standard():
     assert "longer than 120 seconds must be entertaining throughout" in editor.REVIEW_PROMPT
+
+
+def test_each_window_asks_for_a_full_quota_to_rank_not_up_to_n(monkeypatch):
+    prompts = []
+
+    def fake_create(**kwargs):
+        prompts.append(kwargs["messages"][1]["content"])
+        return _openai_reply('{"clips": []}')
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = fake_create
+    monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
+    config = {"openai": {"api_key": "k"}, "settings": {"clips_per_hour": 12}}
+    editor._generate_clips_with_llm(_long_segments(40), config, "gpt-5.5", "SYS", None)
+    window_prompts = [p for p in prompts if not p.startswith("Below are")]
+    assert window_prompts
+    import re
+
+    quotas = [int(re.search(r"Return (\d+) candidate highlights", p).group(1)) for p in window_prompts]
+    assert quotas[0] == 5 and all(q >= 2 for q in quotas) and quotas[-1] <= quotas[0]  # the shorter last window asks for fewer
+    for prompt in window_prompts:
+        assert "RANK, not to gatekeep" in prompt
+        assert "fewer if" not in prompt and "only return candidates scoring 5 or higher" not in prompt
+        assert "never inflate a score" in prompt
+
+
+def test_default_prompt_asks_for_ranked_candidates_with_honest_low_scores():
+    from src.core.config import get_default_config
+
+    prompt = get_default_config()["prompts"]["profiles"]["Default"]
+    assert "HOW MANY CANDIDATES" in prompt and "RANK, not to gatekeep" in prompt
+    assert "'virality_score': integer 1-10" in prompt
+    assert "do NOT return" not in prompt and "Return no more candidates than requested" not in prompt
+    assert "never raise a score to fill a slot" in prompt
+
+
+def test_low_scored_candidates_are_parsed_and_left_for_selection_to_drop():
+    clips = editor._parse_json_clips('{"clips": [{"start_time": 10, "end_time": 40, "virality_score": 3, "reasoning": "meh"}]}')
+    assert clips[0]["virality_score"] == 3
+    from src.core import highlights
+
+    assert highlights.select_clips(clips, duration=3600, min_score=6) == []

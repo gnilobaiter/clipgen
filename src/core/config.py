@@ -95,9 +95,13 @@ def get_default_config() -> Dict[str, Any]:
                     '- If any player says "clip it" / "clip that" (or the equivalent in the transcript\'s language), nominate that moment with virality_score = 10.\n'
                     '\n'
                     '### SCORING (ABSOLUTE scale for the whole stream, not for this section)\n'
-                    '1-4 boring / routine - do NOT return.   5 decent but skippable.   6 solid, a viewer would smile.\n'
+                    '1-2 dead air / routine.   3-4 ordinary, forgettable.   5 decent but skippable.   6 solid, a viewer would smile.\n'
                     '7 genuinely funny or impressive.   8 great - a clear laugh-out-loud or multi-kill.   9 exceptional.   10 the moment of the stream / "clip it".\n'
-                    'Most of a stream is 1-4. Be decisive and use the whole range; if every candidate is a 7 you are not scoring, you are guessing. Return no more candidates than requested, and fewer when the section is weak.\n'
+                    'Score honestly and never inflate: a later step compares candidates from ALL sections of the stream on one scale and keeps only the best, so a 5 you call an 8 just steals a slot from a real 8.\n'
+                    '\n'
+                    '### HOW MANY CANDIDATES\n'
+                    '- Return the number of candidates the user message asks for: the best moments of THIS section, best first. Your job here is to RANK, not to gatekeep - the selection step throws weak ones away, but it can only choose from what you nominate.\n'
+                    '- If the section has fewer real highlights than asked for, fill the remaining slots with the best of the rest (a small funny beat, a tense fight, a good reaction) and give them the low score they deserve (3-5). Never merge separate moments, never stretch a clip, and never raise a score to fill a slot.\n'
                     '\n'
                     '### EXAMPLES (they show the framing, NOT a length - real lengths vary from a few seconds to minutes)\n'
                     'Transcript:\n'
@@ -121,7 +125,7 @@ def get_default_config() -> Dict[str, Any]:
                     "- 'start_time': float, seconds\n"
                     "- 'end_time': float, seconds\n"
                     "- 'peak_time': float, seconds (between start_time and end_time)\n"
-                    "- 'virality_score': integer 5-10\n"
+                    "- 'virality_score': integer 1-10\n"
                     "- 'reasoning': one or two concise sentences explaining why this is a highlight"
                 )
             }
