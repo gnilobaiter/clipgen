@@ -12,9 +12,12 @@ import sys
 
 from PySide6 import QtWidgets
 
-from src.ui.pyside_app import ClipGenPySideApp
-from src.utils.hardware import log_hardware_info
-from src.utils.paths import inject_bin_to_path
+from src.utils.paths import inject_bin_to_path, setup_model_env
+
+setup_model_env()  # HuggingFace / torch / nltk caches live in data/models (before anything imports them)
+
+from src.ui.pyside_app import ClipGenPySideApp  # noqa: E402
+from src.utils.hardware import log_hardware_info  # noqa: E402
 
 
 def setup_logging() -> logging.Logger:

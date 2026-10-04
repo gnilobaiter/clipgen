@@ -31,7 +31,7 @@ def temp_config_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr("src.core.config.get_config_path", lambda: str(test_config_path))
     monkeypatch.setattr("src.ui.pyside_app.config_manager.get_config_path", lambda: str(test_config_path))
-    monkeypatch.setattr("src.ui.pyside_app.get_app_data_path", lambda: str(appdata_dir))
+    monkeypatch.setattr("src.ui.pyside_app.get_logs_dir", lambda: str(appdata_dir / "logs"))
     monkeypatch.setattr("src.utils.paths.get_app_data_path", lambda: str(appdata_dir))
     monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(appdata_dir))
     return str(test_config_path), str(clips_dir)
@@ -50,6 +50,10 @@ def test_pyside_app_initialization(temp_config_env):
     assert window.delete_profile_btn.isEnabled() is False
     assert window.whisper_lang_combo.currentText() == "Auto-Detect"
     assert window.whisper_model_combo.currentText() == "medium"
+    models = [window.whisper_model_combo.itemText(i) for i in range(window.whisper_model_combo.count())]
+    assert {"large-v3", "large-v3-turbo", "distil-large-v3", "tiny.en"} <= set(models)  # every faster-whisper model is offered
+    assert window.cache_checkbox.isChecked()  # the transcript cache is on by default
+    assert window.hf_token_edit.text() == ""
     window.close()
 
 
@@ -86,6 +90,8 @@ def test_pyside_app_save_settings(temp_config_env, monkeypatch):
     window.hw_encode_checkbox.setChecked(True)
     assert window.deepseek_thinking_checkbox.isChecked()  # on by default
     window.deepseek_thinking_checkbox.setChecked(False)
+    window.cache_checkbox.setChecked(False)
+    window.hf_token_edit.setText("  hf_secret  ")
 
     window._save_settings()
 
@@ -95,6 +101,8 @@ def test_pyside_app_save_settings(temp_config_env, monkeypatch):
     assert saved["openai"]["whisper_language"] == "Russian"
     assert saved["openai"]["whisper_model"] == "turbo"
     assert saved["settings"]["hardware_encoding"] is True
+    assert saved["settings"]["use_transcript_cache"] is False
+    assert saved["huggingface"]["token"] == "hf_secret"
 
     window.close()
 

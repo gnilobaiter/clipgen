@@ -1,13 +1,9 @@
 import json
 import os
-import shutil
 import stat
 from typing import Any, Dict, Optional
 
 from src.utils.paths import get_config_path
-
-CONFIG_FILE = get_config_path()
-OLD_LOCAL_CONFIG = "config.json"
 
 def get_default_config() -> Dict[str, Any]:
     return {
@@ -31,6 +27,9 @@ def get_default_config() -> Dict[str, Any]:
         "google": {
             "api_key": ""
         },
+        "huggingface": {
+            "token": ""
+        },
         "integrations": {
             "discord_webhook": ""
         },
@@ -50,7 +49,8 @@ def get_default_config() -> Dict[str, Any]:
             "clips_per_hour": 12,
             "min_clip_score": 6,
             "review_boundaries": True,
-            "deepseek_thinking": True
+            "deepseek_thinking": True,
+            "use_transcript_cache": True
         },
         "active_ai_provider": "openai",
         "openai_model": "gpt-5.5",
@@ -72,11 +72,20 @@ def get_default_config() -> Dict[str, Any]:
                     'You are an elite gaming-highlight editor. You receive one part of a timestamped transcript of a raw gaming stream, annotated with audio tags, and you nominate clip candidates. A separate step picks the final clips and fine-tunes the exact cut points on the audio, so your job is to find the right MOMENTS, frame them tightly and score them honestly.\n'
                     '\n'
                     '### INPUT FORMAT\n'
-                    'Each line: [start - end] then optional tags, then speech. All times are absolute seconds in the source video.\n'
-                    '- [LOUDNESS: X%] - the line rises X% of the way (0-100) above the local background level. Shown only when notable: screaming, laughing, shouting.\n'
-                    '- [ACTION: COMBAT] - sharp gunshot / explosion / impact transients.\n'
-                    "- A line like '⏸ 1.4s' between two lines is a real silence of that length. Lines with NO ⏸ between them are one continuous stretch of speech.\n"
-                    '- Standalone lines like [LAUGHTER 60%], [SCREAM 45%], [LOUD 60%] are detected in the raw audio: LAUGHTER / SCREAM by a pretrained sound classifier (the percentage is its confidence, so 30-50% is already a real signal), LOUD by a loudness detector. They can be wrong. A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these tags when the text looks flat.\n'
+                    'The transcript is JSON Lines: one JSON object per line, in time order. All times are absolute seconds in the source video.\n'
+                    '- Speech line: {"speaker": "SPEAKER_01", "start": 812.0, "end": 815.5, "text": "...", "loudness": 80, "combat": true, "pause_before": 1.4}. Only "start", "end" and "text" are always present.\n'
+                    '- "speaker" - diarization label of WHO is talking. The same label is the same person for the whole stream, a different label is a different person. It can be absent (speakers could not be identified): then judge by the text alone. Never invent names: refer to people as SPEAKER_NN or by what they say.\n'
+                    '- "loudness" - how far (0-100) the line rises above the local background level. Present only when notable: screaming, laughing, shouting.\n'
+                    '- "combat": true - sharp gunshot / explosion / impact transients.\n'
+                    '- "pause_before" - a real silence of that many seconds right before this line. A line WITHOUT "pause_before" follows the previous line directly: it is one continuous stretch of speech.\n'
+                    '- Audio-event line: {"event": "LAUGHTER", "start": 824.5, "end": 829.0, "strength": 60}. The event is LAUGHTER, SCREAM or LOUD, detected in the raw audio: LAUGHTER / SCREAM by a pretrained sound classifier (strength is its confidence, so 30-50 is already a real signal), LOUD by a loudness detector. They can be wrong. A laugh is almost always the reaction to the line(s) just BEFORE it - the joke is the setup + payoff, the laugh is the proof. Speech alone can miss laughter entirely, so trust these events when the text looks flat.\n'
+                    '- In boundary-review requests lines inside the proposed clip carry "in_clip": true; ignore that key otherwise.\n'
+                    '\n'
+                    '### SPEAKERS\n'
+                    "- A conversation is an exchange between different speakers. A question and its answer, a roast and the victim's comeback, a callout and the teammate's reaction belong in ONE clip: never start on the answer without the line that triggered it, and never end between a line and the other speaker's reply.\n"
+                    '- A reaction from a DIFFERENT speaker right after the payoff (their laugh, "no way", a comeback) is part of the payoff: include it.\n'
+                    '- One speaker talking alone with nobody reacting needs real content (a story, a rant, clutch commentary) to be a highlight; several speakers bouncing off each other usually make the stronger banter clip.\n'
+                    '- A change of speaker without "pause_before" is a quick interruption or overlap: that is lively and good for a clip, not a topic change.\n'
                     '\n'
                     '### WHAT IS A HIGHLIGHT\n'
                     '1. COMEDY & BANTER: a clear premise -> payoff, clever roasts, absurd logic, dumb decisions with instant karma, panic screaming, dark humour, laughing fits, friends breaking each other.\n'
@@ -85,13 +94,13 @@ def get_default_config() -> Dict[str, Any]:
                     '\n'
                     '### WHAT MAKES A GOOD CLIP RANGE (this matters most)\n'
                     '- A clip is watched ON ITS OWN by someone who has never seen the stream. It must be understandable and satisfying without anything before or after it.\n'
-                    "- START where the situation becomes understandable: the question that gets answered, the premise, the thing that just happened and is being reacted to. If the payoff needs an earlier line to make sense, include that line, even if it is 10-20 s earlier. Start on a line's [start], preferably right after a ⏸ pause, never in the middle of a sentence or an exchange.\n"
-                    "- END after the payoff AND its reaction has resolved (the laugh, the exclamation, the answer) AND the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): ending one line too early feels cut off. End on a line's [end], preferably right before a ⏸ pause. Never cut a joke, sentence or back-and-forth off, and stop before the conversation moves to another topic.\n"
+                    "- START where the situation becomes understandable: the question that gets answered, the premise, the thing that just happened and is being reacted to. If the payoff needs an earlier line to make sense, include that line, even if it is 10-20 s earlier. Start on a line's \"start\", preferably on a line that has \"pause_before\", never in the middle of a sentence or an exchange.\n"
+                    "- END after the payoff AND its reaction has resolved (the laugh, the exclamation, the answer) AND the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): ending one line too early feels cut off. End on a line's \"end\", preferably right before a line that has \"pause_before\". Never cut a joke, sentence or back-and-forth off, and stop before the conversation moves to another topic.\n"
                     '- ONE moment, ONE topic per clip. A clip must never contain a topic change. Two moments are two clips, even when they follow each other directly.\n'
                     '- Length is only the RESULT of these rules: there is no target and no "typical" length, never aim for one. A one-liner with its laugh can be 8-25 s, a banter exchange 20-60 s, a stretch that is continuously great 1-3 minutes. Absolute maximum 240 s. Do not pad: skip lead-in chatter and stop when the moment is over.\n'
                     '\n'
                     '### HOW TO MARK IT\n'
-                    "- start_time = the [start] of the first line the viewer needs. end_time = the [end] of the last line of the reaction (if a [LAUGHTER]/[SCREAM] line follows the payoff, that line's [end]).\n"
+                    "- start_time = the \"start\" of the first line the viewer needs. end_time = the \"end\" of the last line of the reaction (if a LAUGHTER / SCREAM event follows the payoff, that event's \"end\").\n"
                     '- peak_time = the second of the punchline / climax itself (the funniest or most intense instant).\n'
                     '- Never tile the transcript into back-to-back chunks; unclipped baseline content must separate clips.\n'
                     '- If any player says "clip it" / "clip that" (or the equivalent in the transcript\'s language), nominate that moment with virality_score = 10.\n'
@@ -107,11 +116,11 @@ def get_default_config() -> Dict[str, Any]:
                     '\n'
                     '### EXAMPLES (they show the framing, NOT a length - real lengths vary from a few seconds to minutes)\n'
                     'Transcript:\n'
-                    '[812.0s - 815.5s] Bro, who parks a truck on the ramp?\n'
-                    '[815.5s - 819.0s] I thought it was a wall, okay?!\n'
-                    '[819.0s - 824.5s] [LOUDNESS: 80%] Ahahaha, dude, THE WALL! Are you serious?!\n'
-                    '[824.5s - 829.0s] [LAUGHTER 60%]\n'
-                    "[829.0s - 833.0s] Okay, let's go loot the building.\n"
+                    '{"speaker":"SPEAKER_00","start":812.0,"end":815.5,"text":"Bro, who parks a truck on the ramp?","pause_before":2.1}\n'
+                    '{"speaker":"SPEAKER_01","start":815.5,"end":819.0,"text":"I thought it was a wall, okay?!"}\n'
+                    '{"speaker":"SPEAKER_01","start":819.0,"end":824.5,"text":"Ahahaha, dude, THE WALL! Are you serious?!","loudness":80}\n'
+                    '{"event":"LAUGHTER","start":824.5,"end":829.0,"strength":60}\n'
+                    '{"speaker":"SPEAKER_00","start":829.0,"end":833.0,"text":"Okay, let\'s go loot the building.","pause_before":1.5}\n'
                     'Correct candidate (17 s): {"start_time": 812.0, "end_time": 829.0, "peak_time": 819.0, "virality_score": 8, "reasoning": "Deadpan excuse (\'I thought it was a wall\') followed by a real laughing fit."}\n'
                     'Wrong: start 815.5 (the joke is not understandable without the question), end 824.5 (cuts the laugh), end 833.0 (dead air), or a clip that also swallows the minute of chatter before and after it.\n'
                     '\n'
@@ -137,12 +146,6 @@ def get_default_config() -> Dict[str, Any]:
 def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
     target_file = filepath or get_config_path()
 
-    if not filepath and os.path.exists(OLD_LOCAL_CONFIG) and not os.path.exists(target_file):
-        try:
-            shutil.move(OLD_LOCAL_CONFIG, target_file)
-        except Exception as e:
-            print(f"Failed to migrate old config file: {e}")
-
     if os.path.exists(target_file):
         with open(target_file, 'r', encoding='utf-8') as f:
             try:
@@ -161,6 +164,7 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             settings.setdefault("min_clip_score", 6)
             settings.setdefault("review_boundaries", True)
             settings.setdefault("deepseek_thinking", True)
+            settings.setdefault("use_transcript_cache", True)
             
             openai_cfg = cfg.setdefault("openai", {})
             openai_cfg.setdefault("base_url", "")
@@ -170,6 +174,7 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             cfg.setdefault("deepseek", {"api_key": "", "base_url": "https://api.deepseek.com"})
             cfg.setdefault("anthropic", {"api_key": ""})
             cfg.setdefault("xai", {"api_key": ""})
+            cfg.setdefault("huggingface", {"token": ""}).setdefault("token", "")
             cfg.setdefault("integrations", {"discord_webhook": ""})
             
             # Migration/Defaults for new multi-provider UI

@@ -1,18 +1,25 @@
---extra-index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://download.pytorch.org/whl/cu129
 
 # Core GUI & Utilities
 customtkinter==6.0.0
 PySide6==6.11.2
 Pillow==12.3.0
 pystray==0.19.5
-numpy==2.5.3
+numpy==2.4.6
 
-# Audio & Local AI (Whisper with CUDA support)
-torch==2.14.0
-openai-whisper==20250625
+# Audio & Local AI (WhisperX with CUDA 12.9 support)
+# WhisperX stack (same versions as the whisper-sst project): faster-whisper + wav2vec2 alignment + pyannote diarization
+whisperx==3.8.6
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+pyannote-audio==4.0.7
+torch==2.8.0+cu129
+torchaudio==2.8.0+cu129
+torchvision==0.23.0+cu129
 
 # Sound-event classifier (YAMNet, laughter/screaming). The CUDA 13 build with its own CUDA/cuDNN wheels; it runs in a
-# separate process because torch above ships CUDA 12 with identically named DLLs (see src/core/sound_classifier.py)
+# separate process because torch above ships CUDA 12 with identically named DLLs (see src/core/sound_classifier.py).
+# faster-whisper also installs the CPU 'onnxruntime' (same module name): `make install` reinstalls this GPU build after it
 onnxruntime-gpu[cuda,cudnn]==1.30.0
 
 # Cloud LLM APIs

@@ -64,7 +64,7 @@ class MockWidget:
             return self._var.get()
         return self._text or self._value
 
-    def insert(self, idx, text, *tags):
+    def insert(self, idx, text, *_tags):
         self._text = (self._text or "") + str(text)
 
     def delete(self, start, end=None):
@@ -175,9 +175,23 @@ def isolate_sound_classifier(tmp_path, monkeypatch):
     def no_network(_url, **_kwargs):
         raise OSError("network access is disabled in tests")
 
-    monkeypatch.setattr(sound_classifier, "get_app_data_path", lambda: str(tmp_path / "sound_appdata"))
+    monkeypatch.setattr(sound_classifier, "get_models_dir", lambda: str(tmp_path / "sound_models"))
     monkeypatch.setattr(sound_classifier.urllib.request, "urlopen", no_network)
     monkeypatch.setattr(sound_classifier, "_cpu_session", None)
+
+
+@pytest.fixture(autouse=True)
+def isolate_data_dirs(tmp_path, monkeypatch):
+    """Nothing in the test suite may read or write the real <project>/data folder (models, caches, token file) or
+    <project>/config.json (API keys), or copy the config of an older release from %APPDATA%."""
+    monkeypatch.setattr("src.utils.paths.get_data_dir", lambda: str(tmp_path / "data_dir"))
+    monkeypatch.setattr("src.utils.paths.get_logs_dir", lambda: str(tmp_path / "logs_dir"))
+    monkeypatch.setattr("src.utils.paths.get_models_dir", lambda: str(tmp_path / "data_dir" / "models"))
+    monkeypatch.setattr("src.utils.paths.get_config_dir", lambda: str(tmp_path / "config_dir"))
+    monkeypatch.setattr("src.core.transcriber.get_data_dir", lambda: str(tmp_path / "data_dir"))  # no real data/.hf_token in tests
+    monkeypatch.setattr("src.core.transcriber.get_models_dir", lambda: str(tmp_path / "data_dir" / "models"))
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr("src.utils.paths.get_legacy_config_path", lambda: str(tmp_path / "no_legacy_config.json"))
 
 
 @pytest.fixture(scope="session")
@@ -195,7 +209,7 @@ def mock_app_data(tmp_path, monkeypatch):
     (app_dir / "logs").mkdir(exist_ok=True)
 
     monkeypatch.setattr("src.utils.paths.get_app_data_path", lambda: str(app_dir))
-    monkeypatch.setattr("src.ui.app.get_app_data_path", lambda: str(app_dir))
+    monkeypatch.setattr("src.ui.app.get_logs_dir", lambda: str(app_dir / "logs"))
     monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(app_dir))
     return app_dir
 

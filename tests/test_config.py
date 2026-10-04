@@ -37,7 +37,9 @@ def test_get_default_config():
     assert "virality_score" in default_prompt
     assert "WHAT MAKES A GOOD CLIP RANGE" in default_prompt and "there is no target" in default_prompt
     assert "ONE moment, ONE topic" in default_prompt and "HOW TO MARK IT" in default_prompt
-    assert "⏸" in default_prompt and "closing remark" in default_prompt  # pauses are shown to the AI, endings include the tag line
+    assert "pause_before" in default_prompt and "closing remark" in default_prompt  # pauses are shown to the AI, endings include the tag line
+    assert "JSON Lines" in default_prompt and "SPEAKERS" in default_prompt and "SPEAKER_01" in default_prompt  # JSONL transcript with diarization labels
+    assert "⏸" not in default_prompt and "[LOUDNESS" not in default_prompt  # the old text format is gone
     assert "cut shorter" not in default_prompt  # "when in doubt, cut shorter" produced clips without their setup
     assert config["settings"]["review_boundaries"] is True
     # the old numeric "typical" ranges and the 90 s cap used to be read by the model as a length to aim for
@@ -78,15 +80,6 @@ def test_load_config_no_file(tmp_path):
     temp_config = tmp_path / "nonexistent.json"
     config = load_config(filepath=str(temp_config))
     assert config == get_default_config()
-
-
-def test_load_config_migration(tmp_path, monkeypatch):
-    old_cfg = tmp_path / "old_config.json"
-    new_cfg = tmp_path / "new_config.json"
-    old_cfg.write_text(json.dumps({"test": "data"}), encoding="utf-8")
-    monkeypatch.setattr("src.core.config.OLD_LOCAL_CONFIG", str(old_cfg))
-    cfg = load_config(filepath=str(new_cfg))
-    assert cfg is not None
 
 
 def test_load_config_invalid_json(tmp_path, monkeypatch):

@@ -24,7 +24,7 @@ def test_cuda_detected_gpu_mode(monkeypatch):
     assert "GPU: NVIDIA GeForce RTX 4080" in summary
     assert len(logs) == 2
     assert "NVIDIA GeForce RTX 4080" in logs[0]
-    assert "CUDA fp16" in logs[1]
+    assert "CUDA float16" in logs[1]
 
 
 def test_cuda_unavailable_cpu_mode(monkeypatch):

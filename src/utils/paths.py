@@ -11,19 +11,66 @@ def get_bin_dir() -> str:
     """Returns the absolute path to the local bin directory inside the project."""
     return os.path.join(get_project_root(), "bin")
 
+def get_data_dir() -> str:
+    """Returns <project root>/data: the downloaded AI models (data/models), the transcript cache and the optional
+    HuggingFace token file (git-ignored). With config.json and logs/ in the project root, nothing is kept in the user profile."""
+    data_dir = os.path.join(get_project_root(), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    guard = os.path.join(data_dir, ".gitignore")
+    if not os.path.exists(guard):  # several GB of models: keep them out of git even if the root .gitignore changes
+        try:
+            with open(guard, "w", encoding="utf-8") as f:
+                f.write("*\n")
+        except OSError:
+            pass
+    return data_dir
+
+def get_models_dir() -> str:
+    """Returns <project root>/data/models: the downloaded AI models (Whisper, HuggingFace / pyannote, torch, nltk, YAMNet)."""
+    models_dir = os.path.join(get_data_dir(), "models")
+    os.makedirs(models_dir, exist_ok=True)
+    return models_dir
+
 def get_app_data_path() -> str:
-    """Returns the application data directory (%APPDATA%/jBahrsClipGenerator on Windows)."""
-    app_data = os.getenv("APPDATA")
-    if not app_data:
-        app_data = os.path.expanduser("~")
-    config_dir = os.path.join(str(app_data), "jBahrsClipGenerator")
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir, exist_ok=True)
-    return config_dir
+    """Returns the application data directory (<project root>/data): transcript cache and the token file."""
+    return get_data_dir()
+
+def get_logs_dir() -> str:
+    """Returns <project root>/logs (git-ignored): execution and crash logs."""
+    logs_dir = os.path.join(get_project_root(), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    return logs_dir
+
+def get_legacy_config_path() -> str:
+    """Config location of older releases (%APPDATA%/jBahrsClipGenerator/config.json). Read-only: used for a one-time copy."""
+    base = os.getenv("APPDATA") or os.path.expanduser("~")
+    return os.path.join(str(base), "jBahrsClipGenerator", "config.json")
+
+def get_config_dir() -> str:
+    """Folder of config.json: the project root (git-ignored)."""
+    return get_project_root()
 
 def get_config_path() -> str:
-    """Returns the absolute path to the config.json file in APPDATA."""
-    return os.path.join(get_app_data_path(), "config.json")
+    """Returns the absolute path to <project root>/config.json (API keys, HuggingFace token, settings, prompts).
+    A config left in %APPDATA% by an older release is copied here once (that old file is never deleted)."""
+    path = os.path.join(get_config_dir(), "config.json")
+    if not os.path.exists(path):
+        legacy = get_legacy_config_path()
+        try:
+            if os.path.isfile(legacy):
+                shutil.copy2(legacy, path)
+        except OSError:
+            pass
+    return path
+
+def setup_model_env() -> None:
+    """Points HuggingFace / torch / nltk caches into data/models (must run before whisperx / transformers are imported).
+    Overrides a global HF_HOME / TORCH_HOME / NLTK_DATA on purpose: all downloaded models must live in data/models."""
+    models_dir = get_models_dir()
+    os.environ["HF_HOME"] = os.path.join(models_dir, "huggingface")
+    os.environ["TORCH_HOME"] = os.path.join(models_dir, "torch")
+    os.environ["NLTK_DATA"] = os.path.join(models_dir, "nltk")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 def inject_bin_to_path() -> None:
     """Prepends the project's local bin/ folder to the system PATH environment variable."""

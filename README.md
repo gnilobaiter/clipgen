@@ -1,7 +1,7 @@
 # 🎬 Clip Generator
 
 [![Python Version](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch CUDA](https://img.shields.io/badge/CUDA-12.6%20Accelerated-76B900?logo=nvidia&logoColor=white)](https://pytorch.org/)
+[![PyTorch CUDA](https://img.shields.io/badge/CUDA-12.9%20Accelerated-76B900?logo=nvidia&logoColor=white)](https://pytorch.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/Code%20Style-Ruff-black?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
 [![GUI: CustomTkinter](https://img.shields.io/badge/GUI-CustomTkinter-blue)](https://github.com/TomSchimansky/CustomTkinter)
 
@@ -14,15 +14,16 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 ## 🌟 Key Features
 
 ### 🎙️ Audio Intelligence & Local Whisper
-* **100% Free Local GPU Transcription:** Runs OpenAI's Whisper model directly on your NVIDIA GPU (`cuda` / `fp16`) or CPU fallback. Zero transcription API costs.
-* **Deterministic Disk Caching:** Transcriptions are automatically hashed and cached on disk (`%APPDATA%/jBahrsClipGenerator/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing.
+* **100% Free Local GPU Transcription:** Runs **WhisperX** (batched faster-whisper + wav2vec2 word alignment + pyannote speaker diarization) on your NVIDIA GPU (`cuda` / `float16`) or on the CPU (`int8`). Every faster-whisper model is selectable in Settings (`tiny` ... `large-v3`, `large-v3-turbo`, `distil-*`). Zero transcription API costs.
+* **Speaker Labels (always on):** the transcript knows *who* is talking (`SPEAKER_00`, `SPEAKER_01`, ...) and the AI uses it to keep question + answer and joke + reaction together. Needs a free HuggingFace token with the terms of `pyannote/speaker-diarization-community-1` accepted (Settings -> HuggingFace Token, the `HF_TOKEN` environment variable or `data/.hf_token`). Without a token transcripts are made without speakers and a warning is logged.
+* **Deterministic Disk Caching:** Transcriptions are hashed and cached on disk (`data/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing. It can be switched off globally in Settings (**Use transcript cache**, on by default).
 * **Local-Baseline Loudness:** Every transcript line gets `[LOUDNESS: X%]` measured against the *surrounding* background level (rolling ±30 s median), not the global maximum, so one huge scream no longer flattens the rest of the stream.
 * **Laughter / Scream Detection (YAMNet on GPU):** Whisper does not transcribe laughter, so the audio is also run through Google's pretrained **YAMNet** AudioSet classifier (16 MB ONNX model, `onnxruntime-gpu`). Confident laughter / screaming / shouting frames become standalone `[LAUGHTER 60%]` / `[SCREAM 45%]` lines in the transcript (the percentage is the classifier's confidence, so 30-50% is already a real signal); short peaks 18+ dB over the local background add `[LOUD 60%]`. A 90-minute VOD is classified in ~2 s on an RTX GPU.
-  * The model is downloaded once to `%APPDATA%/jBahrsClipGenerator/models/yamnet.onnx` from a pinned Hugging Face commit and verified against a SHA256 before use.
+  * The model is downloaded once to `data/models/yamnet.onnx` from a pinned Hugging Face commit and verified against a SHA256 before use.
   * Inference runs in a **separate process**: `onnxruntime-gpu` is built for CUDA 13 while PyTorch ships CUDA 12, and both use identically named DLLs (`cudnn64_9.dll`, ...). Loading both into one Windows process can crash it, a child process cannot take the app down. If the GPU worker fails, the classifier retries on CPU (~12 s per 90 min); if it is unavailable altogether (e.g. offline on the first run) clipping continues without laughter/scream tags.
   * `onnxruntime-gpu[cuda,cudnn]` pulls its own CUDA 13 libraries (~1 GB of disk) and needs an NVIDIA driver with CUDA 13 support (580+).
 * **Combat & Transient Action Detection:** Sharp percussive transients (gunshots, explosions, hits) are tagged `[ACTION: COMBAT]`.
-* **Word-Level Timestamps:** Whisper runs with `word_timestamps`, which is what makes precise clip boundaries possible.
+* **Word-Level Timestamps:** WhisperX aligns every word with a wav2vec2 model, which is what makes precise clip boundaries possible.
 * **Multi-Track OBS Downmixing:** Automatically inspects multi-track containers via `ffprobe` and downmixes all channels (Mic, Discord, Game) via FFmpeg `amix` to ensure no speech is lost.
 
 ### 🧠 Multi-Provider LLM Highlight Detection
@@ -69,7 +70,7 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 flowchart LR
     A[Raw Local Video / Recording] --> B[FFmpeg Audio Ingestion]
     B -->|amix Multi-Track| C[16kHz PCM Buffer]
-    C --> D[Local GPU Whisper + word timestamps]
+    C --> D[Local GPU WhisperX + word timestamps + speakers]
     C --> E[Local-baseline loudness + combat + YAMNet laughter/scream events]
     D & E --> F[Annotated Transcript]
     F --> G1[LLM: candidates per 12-min window]
@@ -87,11 +88,11 @@ flowchart LR
 
 ### Minimum Requirements
 * **Operating System:** Windows 10/11 (64-bit)
-* **Python:** 3.12 or 3.13 (the pinned `numpy` 2.5 requires 3.12+)
+* **Python:** 3.12 or 3.13 (WhisperX 3.8 requires < 3.14)
 * **Package Manager:** [`uv`](https://github.com/astral-sh/uv) (strongly recommended) and `make`
 
 ### Hardware Recommendations
-* **GPU:** NVIDIA GeForce RTX / GTX series (driver with CUDA 13 support, 580+) for local Whisper acceleration (`fp16`), YAMNet sound classification and NVENC video exports.
+* **GPU:** NVIDIA GeForce RTX / GTX series (driver with CUDA 13 support, 580+) for local WhisperX acceleration (`float16`), YAMNet sound classification and NVENC video exports.
 * **RAM:** 16 GB+
 * **Disk Space:** High-speed SSD storage for video scratch buffers and caches.
 
@@ -147,9 +148,11 @@ uv venv .venv
 # 2. Activate virtual environment
 .venv\Scripts\activate
 
-# 3. Install dependencies with PyTorch CUDA 12.6 support
+# 3. Install dependencies with PyTorch CUDA 12.9 support
 #    (unsafe-best-match lets uv take numpy & co. from PyPI while torch comes from the CUDA index)
-uv pip install --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt -r requirements-dev.txt
+uv pip install --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu129 -r requirements.txt -r requirements-dev.txt
+#    faster-whisper installs the CPU `onnxruntime`, which shares its module with `onnxruntime-gpu`: put the GPU build back on top
+uv pip install --reinstall --no-deps onnxruntime-gpu==1.30.0
 
 # 4. Launch the application
 python main.py
@@ -187,7 +190,7 @@ This target executes:
 ### 2. Video Highlight Extraction
 1. Go to the **🎬 Clip Extractor** tab.
 2. Select local video file(s) (`.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`) using the **Browse Files** button or enter file paths.
-3. Choose the active **Prompt Profile** in Prompt Manager and **Whisper Model** (`tiny`, `base`, `small`, `medium`, `large`). In Settings, tune **Target clips per hour** to control how many clips you get (more clips = lower score bar; `0` disables the limit).
+3. Choose the active **Prompt Profile** in Prompt Manager and **Whisper Model** (any faster-whisper model: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`, `distil-*`, ...). In Settings, tune **Target clips per hour** to control how many clips you get (more clips = lower score bar; `0` disables the limit).
 4. Click **"Process Files"** to begin analysis and export.
 
 ### 3. Clip Gallery
@@ -200,11 +203,14 @@ This target executes:
 
 ## ⚙️ Configuration Reference
 
-Application settings and cached data are stored in `%APPDATA%/jBahrsClipGenerator/`:
-* `config.json` — Active provider, model preferences, crop dimensions, and storage paths.
-* `transcripts/` — Cached Whisper JSON transcripts (segments, word timestamps, audio events) indexed by video metadata hashes. The cache is versioned; a transcript cached by an older release is upgraded automatically by reusing the Whisper text and re-analysing only the audio (seconds instead of a new transcription).
+Everything the app stores lives inside the project folder (nothing is kept in your user profile or on another drive location):
+> ⚠️ `config.json` in the project root holds your API keys and HuggingFace token in plain text. It is git-ignored, but do not zip, share or cloud-sync it. `data/` (git-ignored, with its own `.gitignore`) holds several GB. The app points `HF_HOME` / `TORCH_HOME` / `NLTK_DATA` into `data/models`, overriding any global setting. Speaker diarization runs on the whole recording at once: on very long streams it can run out of memory, in which case the transcript is made without speakers (logged).
+* `config.json` (project root, next to the `Makefile`) — API keys, HuggingFace token, active provider, model preferences, crop dimensions, storage paths. A `config.json` left by an older release in `%APPDATA%/jBahrsClipGenerator/` is copied here once; the old folder can then be deleted.
+* `data/models/` — the downloaded AI models: `whisper/` (faster-whisper), `huggingface/` (alignment + pyannote diarization), `torch/`, `nltk/`, `yamnet.onnx` (sound classifier).
+* `data/transcripts/` — Cached transcripts, one JSON document per video: `{version, engine, model, language, diarized, speakers, segments}` (segments carry `speaker`, word timestamps, loudness and audio events). The cache is versioned and keyed by the video, Whisper model, language and whether speakers could be labelled; transcripts of older releases are not reused. `settings.use_transcript_cache` (default `true`) turns it off globally: nothing is read or written.
+* `logs/` (project root, git-ignored) — Timestamped execution and error logs. `data/.hf_token` — optional file with the HuggingFace token.
+* The AI reads the transcript as JSON Lines, one object per line (`speaker`, `start`, `end`, `text`, optional `loudness`, `combat`, `pause_before`, and `{"event": "LAUGHTER", ...}` lines). The built-in Default prompt explains this format; **custom prompt profiles written for the old `[start - end]` text format must be updated by hand**.
 * `settings.clips_per_hour` (default `12`, `0` = unlimited) and `settings.min_clip_score` (default `6`) in `config.json` control how many clips are exported. `settings.review_boundaries` (default `true`) switches the scene-based boundary review, `settings.deepseek_thinking` (default `true`) DeepSeek's reasoning mode.
-* `logs/` — Timestamped execution and error logs.
 
 ---
 

@@ -45,7 +45,7 @@ def log_hardware_info(logger: Optional[Callable[[str], None]] = None) -> str:
     if status["cuda_available"]:
         gpu_info = f"{status['gpu_name']} ({status['vram_gb']} GB VRAM)" if status.get("vram_gb") else status["gpu_name"]
         primary_msg = f"🧠 Hardware Check: NVIDIA GPU Detected ({gpu_info})"
-        speed_msg = "🚀 Processing Mode: GPU (CUDA fp16 acceleration active - maximum speed)"
+        speed_msg = "🚀 Processing Mode: GPU (CUDA float16 acceleration active - maximum speed)"
         
         if logger:
             logger(primary_msg)
@@ -57,7 +57,7 @@ def log_hardware_info(logger: Optional[Callable[[str], None]] = None) -> str:
         return f"GPU: {status['gpu_name']} (CUDA fp16 active)"
     else:
         primary_msg = "⚠️ Hardware Check: No NVIDIA CUDA GPU detected."
-        mode_msg = "⏳ Processing Mode: CPU (Whisper transcription will run on CPU, processing will take longer)"
+        mode_msg = "⏳ Processing Mode: CPU (WhisperX transcription will run on CPU with int8, processing will take longer)"
         
         if logger:
             logger(primary_msg)

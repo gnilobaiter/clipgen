@@ -14,10 +14,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.core import config as config_manager
 from src.core import editor
+from src.core import transcriber as whisper_backend
 from src.services import model_fetcher
 from src.utils import log_style
 from src.utils.hardware import get_hardware_status
-from src.utils.paths import get_app_data_path, inject_bin_to_path
+from src.utils.paths import get_logs_dir, inject_bin_to_path
 
 inject_bin_to_path()
 
@@ -495,8 +496,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         self.signals.model_list_updated.connect(self._on_model_list_updated)
 
     def _init_logging(self):
-        app_data = get_app_data_path()
-        log_dir = os.path.join(app_data, "logs")
+        log_dir = get_logs_dir()
         os.makedirs(log_dir, exist_ok=True)
 
         formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -1220,6 +1220,12 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         whisper_layout.addWidget(w_model_label, 1, 0)
         whisper_layout.addWidget(self.whisper_model_combo, 1, 1)
 
+        self.whisper_model_status = QtWidgets.QLabel("", whisper_card)
+        self.whisper_model_status.setProperty("class", "page-subtitle")
+        self.whisper_model_combo.currentTextChanged.connect(self._update_whisper_model_status)
+        self._update_whisper_model_status(self.whisper_model_combo.currentText())
+        whisper_layout.addWidget(self.whisper_model_status, 2, 1)
+
         # Audio Language
         w_lang_label = QtWidgets.QLabel("Spoken Language:", whisper_card)
         w_lang_label.setProperty("class", "field-label")
@@ -1230,29 +1236,45 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         ])
         self.whisper_lang_combo.setCurrentText(self.config.get("openai", {}).get("whisper_language", "Auto-Detect"))
 
-        whisper_layout.addWidget(w_lang_label, 2, 0)
-        whisper_layout.addWidget(self.whisper_lang_combo, 2, 1)
+        whisper_layout.addWidget(w_lang_label, 3, 0)
+        whisper_layout.addWidget(self.whisper_lang_combo, 3, 1)
+
+        # Speaker diarization is always on; it needs a HuggingFace token (model terms accepted) to download pyannote
+        hf_label = QtWidgets.QLabel("HuggingFace Token (speaker labels):", whisper_card)
+        hf_label.setProperty("class", "field-label")
+        self.hf_token_edit = QtWidgets.QLineEdit(whisper_card)
+        self.hf_token_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.hf_token_edit.setPlaceholderText("hf_... (or the HF_TOKEN env variable / data/.hf_token)")
+        self.hf_token_edit.setText(self.config.get("huggingface", {}).get("token", ""))
+        self.hf_token_edit.setToolTip("Speaker diarization is always on. Accept the terms of pyannote/speaker-diarization-community-1 on huggingface.co, "
+                                      "then paste a read token here. Without a token transcripts are made without speaker labels.")
+        whisper_layout.addWidget(hf_label, 4, 0)
+        whisper_layout.addWidget(self.hf_token_edit, 4, 1)
 
         # Audio Switches
         self.downmix_checkbox = QtWidgets.QCheckBox("Downmix Multi-Track OBS Audio (amix filter)", whisper_card)
         self.downmix_checkbox.setChecked(self.config.get("settings", {}).get("audio_downmix", True))
-        whisper_layout.addWidget(self.downmix_checkbox, 3, 0)
+        whisper_layout.addWidget(self.downmix_checkbox, 5, 0)
 
         self.peak_checkbox = QtWidgets.QCheckBox("Audio Peak & Screaming Loudness Mapping", whisper_card)
         self.peak_checkbox.setChecked(self.config.get("settings", {}).get("audio_peak_detection", True))
-        whisper_layout.addWidget(self.peak_checkbox, 3, 1)
+        whisper_layout.addWidget(self.peak_checkbox, 5, 1)
 
         self.combat_checkbox = QtWidgets.QCheckBox("Gunfight & Combat Transient Spikes Detection", whisper_card)
         self.combat_checkbox.setChecked(self.config.get("settings", {}).get("combat_detection", True))
-        whisper_layout.addWidget(self.combat_checkbox, 4, 0, 1, 2)
+        whisper_layout.addWidget(self.combat_checkbox, 6, 0, 1, 2)
+
+        self.cache_checkbox = QtWidgets.QCheckBox("Use transcript cache (reuse a finished transcription of the same video; off = always transcribe from scratch)", whisper_card)
+        self.cache_checkbox.setChecked(self.config.get("settings", {}).get("use_transcript_cache", True))
+        whisper_layout.addWidget(self.cache_checkbox, 7, 0, 1, 2)
 
         clips_label = QtWidgets.QLabel("Target clips per hour of video (0 = no limit):", whisper_card)
         clips_label.setProperty("class", "field-label")
         self.clips_per_hour_spin = QtWidgets.QSpinBox(whisper_card)
         self.clips_per_hour_spin.setRange(0, 60)
         self.clips_per_hour_spin.setValue(int(self.config.get("settings", {}).get("clips_per_hour", 12)))
-        whisper_layout.addWidget(clips_label, 5, 0)
-        whisper_layout.addWidget(self.clips_per_hour_spin, 5, 1)
+        whisper_layout.addWidget(clips_label, 8, 0)
+        whisper_layout.addWidget(self.clips_per_hour_spin, 8, 1)
 
         layout.addWidget(whisper_card)
 
@@ -1734,11 +1756,13 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
 
         self.config.setdefault("openai", {})["whisper_model"] = self.whisper_model_combo.currentText()
         self.config.setdefault("openai", {})["whisper_language"] = self.whisper_lang_combo.currentText()
+        self.config.setdefault("huggingface", {})["token"] = self.hf_token_edit.text().strip()
 
         settings = self.config.setdefault("settings", {})
         settings["audio_downmix"] = self.downmix_checkbox.isChecked()
         settings["audio_peak_detection"] = self.peak_checkbox.isChecked()
         settings["combat_detection"] = self.combat_checkbox.isChecked()
+        settings["use_transcript_cache"] = self.cache_checkbox.isChecked()
         settings["clips_per_hour"] = self.clips_per_hour_spin.value()
         settings["deepseek_thinking"] = self.deepseek_thinking_checkbox.isChecked()
         settings["hardware_encoding"] = self.hw_encode_checkbox.isChecked()
@@ -1752,6 +1776,17 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         config_manager.save_config(self.config)
         self.log_to_console("💾 Configuration saved successfully.", "system")
         QtWidgets.QMessageBox.information(self, "Settings Saved", "Configuration saved successfully!")
+
+    def _update_whisper_model_status(self, model_name: str):
+        """Shows whether the selected Whisper model is already in data/models/whisper or will be downloaded on first use."""
+        if not hasattr(self, "whisper_model_status"):
+            return
+        if model_name not in whisper_backend.available_models():
+            self.whisper_model_status.setText("custom model (local path or repo id): loaded as given")
+        elif whisper_backend.is_model_downloaded(model_name):
+            self.whisper_model_status.setText("✓ downloaded (data/models/whisper)")
+        else:
+            self.whisper_model_status.setText("not downloaded yet: fetched automatically on first use")
 
     def _test_openai_key(self):
         key = self.openai_key_edit.text().strip()

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from src.core import highlights as hl
@@ -14,10 +16,26 @@ def _clip(start, end, score=8, **extra):
 # --------------------------- formatting & windows ---------------------------
 def test_format_entry_tags_and_events():
     line = hl.format_entry(_seg(1.0, 2.5, " hi ", loudness=80, is_combat=True))
-    assert line == "[1.0s - 2.5s] [LOUDNESS: 80%] [ACTION: COMBAT] hi\n"
-    assert hl.format_entry(_seg(1.0, 2.0, "plain", loudness=10)) == "[1.0s - 2.0s] plain\n"
+    assert line == '{"start":1.0,"end":2.5,"text":"hi","loudness":80,"combat":true}\n'
+    assert hl.format_entry(_seg(1.0, 2.0, "plain", loudness=10)) == '{"start":1.0,"end":2.0,"text":"plain"}\n'
     event = {"start": 5.0, "end": 8.0, "text": "", "event": "LAUGHTER", "strength": 70}
-    assert hl.format_entry(event) == "[5.0s - 8.0s] [LAUGHTER 70%]\n"
+    assert hl.format_entry(event) == '{"event":"LAUGHTER","start":5.0,"end":8.0,"strength":70}\n'
+
+
+def test_format_entry_speaker_pause_and_in_clip():
+    seg = _seg(1.0, 2.0, "привет", speaker="SPEAKER_01")
+    assert json.loads(hl.format_entry(seg, pause_before=1.54, in_clip=True)) == {
+        "speaker": "SPEAKER_01", "start": 1.0, "end": 2.0, "text": "привет", "pause_before": 1.5, "in_clip": True}
+    assert "привет" in hl.format_entry(seg)  # not ASCII-escaped
+    assert "speaker" not in hl.format_entry(_seg(1.0, 2.0, "x"))
+
+
+def test_build_utterances_never_joins_different_speakers():
+    a = _seg(0.0, 1.0, "и вот", speaker="SPEAKER_00")
+    b = _seg(1.1, 2.0, "да", speaker="SPEAKER_01")
+    c = _seg(2.1, 3.0, "ага", speaker="SPEAKER_01")
+    out = hl.build_utterances([a, b, c])
+    assert [(u["speaker"], u["text"]) for u in out] == [("SPEAKER_00", "и вот"), ("SPEAKER_01", "да ага")]
 
 
 def test_build_windows_single_for_short_video():
@@ -334,10 +352,9 @@ def test_transcript_shows_real_pauses_and_none_inside_continuous_speech():
     lines = [_u(0.0, 3.0, "первая"), _u(3.3, 5.0, "вторая без паузы"), _u(6.5, 8.0, "третья после паузы"),
              {"start": 8.2, "end": 9.0, "text": "", "event": "LAUGHTER", "strength": 60}, _u(12.0, 13.0, "четвёртая")]
     text = hl.format_transcript(lines)
-    assert "⏸ 1.5s" in text and "⏸ 4.0s" in text  # the gap to the line after the laugh is measured from the last speech end
-    assert text.count("⏸") == 2  # the 0.3 s gap between the first two lines is not a pause
-    assert text.index("вторая без паузы") < text.index("⏸ 1.5s") < text.index("третья после паузы")
-    assert "[LAUGHTER 60%]" in text
-    marked = hl.format_transcript(lines, lambda e: "> " if e["start"] < 6 else "  ")
-    assert marked.startswith("> [0.0s - 3.0s]") and "  ⏸ 1.5s" in marked
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert [r.get("pause_before") for r in rows] == [None, None, 1.5, None, 4.0]  # the gap after the laugh is measured from the last speech end; 0.3 s is no pause
+    assert rows[3] == {"event": "LAUGHTER", "start": 8.2, "end": 9.0, "strength": 60}
+    marked = [json.loads(line) for line in hl.format_transcript(lines, lambda e: e["start"] < 6).splitlines()]
+    assert [bool(r.get("in_clip")) for r in marked] == [True, True, False, False, False]
     assert hl.format_transcript([]) == ""

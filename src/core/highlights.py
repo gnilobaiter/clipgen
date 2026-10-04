@@ -4,6 +4,7 @@ Pipeline position:  transcript + audio events -> windows -> [LLM candidates] -> 
                     -> density-based selection -> boundary refinement -> FFmpeg
 """
 
+import json
 import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,37 +37,46 @@ LONG_SEGMENT = 12.0  # segments longer than this are snapped at word level inste
 # --------------------------------------------------------------------------------------
 # Transcript formatting & windowing
 # --------------------------------------------------------------------------------------
-def format_entry(entry: Dict[str, Any]) -> str:
-    """One transcript line. Segments carry [LOUDNESS]/[ACTION] tags, events are their own lines."""
-    start, end = entry["start"], entry["end"]
+def format_entry(entry: Dict[str, Any], pause_before: Optional[float] = None, in_clip: bool = False) -> str:
+    """One transcript line = one compact JSON object. Speech lines carry `speaker` (when diarized), `loudness` / `combat`
+    (only when notable) and `pause_before`; detected audio events are their own objects with an `event` key."""
+    obj: Dict[str, Any] = {}
     if entry.get("event"):
-        return f"[{start:.1f}s - {end:.1f}s] [{entry['event']} {entry.get('strength', 0)}%]\n"
-    tags = []
-    loudness = entry.get("loudness")
-    if loudness is not None and loudness >= LOUDNESS_TAG_MIN:
-        tags.append(f"[LOUDNESS: {int(loudness)}%]")
-    if entry.get("is_combat"):
-        tags.append("[ACTION: COMBAT]")
-    text = str(entry.get("text", "")).strip()
-    prefix = " ".join(tags)
-    return f"[{start:.1f}s - {end:.1f}s] {prefix + ' ' if prefix else ''}{text}\n"
+        obj = {"event": entry["event"], "start": round(float(entry["start"]), 1), "end": round(float(entry["end"]), 1),
+               "strength": int(entry.get("strength", 0))}
+    else:
+        if entry.get("speaker"):
+            obj["speaker"] = str(entry["speaker"])
+        obj["start"], obj["end"] = round(float(entry["start"]), 1), round(float(entry["end"]), 1)
+        obj["text"] = str(entry.get("text", "")).strip()
+        loudness = entry.get("loudness")
+        if loudness is not None and loudness >= LOUDNESS_TAG_MIN:
+            obj["loudness"] = int(loudness)
+        if entry.get("is_combat"):
+            obj["combat"] = True
+        if pause_before is not None:
+            obj["pause_before"] = round(pause_before, 1)
+    if in_clip:
+        obj["in_clip"] = True
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-PAUSE_MARK_SECONDS = 0.8  # silences at least this long are shown to the AI as a "⏸" line
+PAUSE_MARK_SECONDS = 0.8  # silences at least this long are shown to the AI as `pause_before`
 
 
-def format_transcript(lines: List[Dict[str, Any]], mark: Optional[Any] = None) -> str:
-    """Transcript text for the AI. Between two spoken lines that are at least PAUSE_MARK_SECONDS apart a
-    "⏸ 1.4s" line is inserted: lines WITHOUT such a marker between them are continuous speech (a clip that starts
-    or ends there usually cuts a sentence or a reaction in half). `mark(entry)` may return a prefix per line."""
+def format_transcript(lines: List[Dict[str, Any]], in_clip: Optional[Any] = None) -> str:
+    """Transcript text for the AI: JSON Lines, one object per line. A spoken line that follows a silence of at least
+    PAUSE_MARK_SECONDS gets `pause_before` (seconds): lines WITHOUT it are continuous speech (a clip that starts or ends
+    there usually cuts a sentence or a reaction in half). `in_clip(entry)` marks the lines inside a proposed clip."""
     out: List[str] = []
     prev_end: Optional[float] = None
     for entry in lines:
+        pause: Optional[float] = None
         if not entry.get("event"):
             if prev_end is not None and float(entry["start"]) - prev_end >= PAUSE_MARK_SECONDS:
-                out.append(f"  ⏸ {float(entry['start']) - prev_end:.1f}s\n")
+                pause = float(entry["start"]) - prev_end
             prev_end = max(prev_end or 0.0, float(entry["end"]))
-        out.append((mark(entry) if mark else "") + format_entry(entry))
+        out.append(format_entry(entry, pause, bool(in_clip(entry)) if in_clip else False))
     return "".join(out)
 
 
@@ -393,7 +403,7 @@ _SENTENCE_END = re.compile(r"[.?!…]\s*$")
 
 
 def build_utterances(segments: List[Dict[str, Any]], gap: float = UTTERANCE_GAP, max_len: float = UTTERANCE_MAX) -> List[Dict[str, Any]]:
-    """Joins Whisper segments that are one continuous stretch of speech.
+    """Joins Whisper segments that are one continuous stretch of speech (of one speaker: a change of `speaker` always starts a new line).
 
     Whisper splits arbitrarily: a phrase can be cut between two lines ("... от 1 от" / "0 до 9 ..."), which makes any
     clip boundary chosen from those lines logically ragged. Two neighbouring segments are merged when there is no real
@@ -410,6 +420,7 @@ def build_utterances(segments: List[Dict[str, Any]], gap: float = UTTERANCE_GAP,
         if current is not None:
             silence = float(seg["start"]) - float(current["end"])
             joins = (silence < gap and not _SENTENCE_END.search(str(current["text"]))
+                     and current.get("speaker") == seg.get("speaker")
                      and float(seg["end"]) - float(current["start"]) <= max_len)
             if joins:
                 current["end"] = max(float(current["end"]), float(seg["end"]))

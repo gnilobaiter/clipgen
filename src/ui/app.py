@@ -25,7 +25,7 @@ from src.core import config as config_manager
 from src.core import editor
 from src.services import model_fetcher
 from src.utils.hardware import log_hardware_info
-from src.utils.paths import get_app_data_path, inject_bin_to_path
+from src.utils.paths import get_logs_dir, inject_bin_to_path
 
 inject_bin_to_path()
 
@@ -925,7 +925,7 @@ class ClipGenApp(ctk.CTk):
     # LOGGING & CONSOLE STREAM
     # ==============================================================================
     def _init_logging(self):
-        log_dir = os.path.join(get_app_data_path(), "logs")
+        log_dir = get_logs_dir()
         os.makedirs(log_dir, exist_ok=True)
         formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         
@@ -987,7 +987,7 @@ class ClipGenApp(ctk.CTk):
             self.manual_logger.info(clean_msg)
         
         try:
-            crash_log_path = os.path.join(get_app_data_path(), "app_crash_log.txt")
+            crash_log_path = os.path.join(get_logs_dir(), "app_crash_log.txt")
             with open(crash_log_path, "a", encoding="utf-8") as f:
                 f.write(display_text + "\n")
         except Exception:
@@ -1190,11 +1190,11 @@ class ClipGenApp(ctk.CTk):
             entry_widget.insert(0, folder_selected)
 
     def open_logs(self):
-        log_path = os.path.join(get_app_data_path(), "app_crash_log.txt")
+        log_path = os.path.join(get_logs_dir(), "app_crash_log.txt")
         if os.path.exists(log_path):
             subprocess.run(['explorer', '/select,', log_path], timeout=5)
         else:
-            app_data_path = get_app_data_path()
+            app_data_path = get_logs_dir()
             if hasattr(os, 'startfile'):
                 os.startfile(os.path.abspath(app_data_path))
 

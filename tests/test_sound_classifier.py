@@ -86,7 +86,7 @@ class _FakeResponse(io.BytesIO):
 
 
 def _use_payload(monkeypatch, tmp_path, payload: bytes, served=None):
-    monkeypatch.setattr(sc, "get_app_data_path", lambda: str(tmp_path))
+    monkeypatch.setattr(sc, "get_models_dir", lambda: str(tmp_path / "models"))
     monkeypatch.setattr(sc, "MODEL_SHA256", hashlib.sha256(payload).hexdigest())
     downloads = []
 

@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from src.core.audio_events import group_runs
-from src.utils.paths import get_app_data_path, get_project_root
+from src.utils.paths import get_models_dir, get_project_root
 
 MODEL_URL = "https://huggingface.co/andrelgomes/yamnet-onnx/resolve/8a03a1572569685c42fdbef54ff36435dbaaf689/yamnet.onnx"
 MODEL_SHA256 = "1510041dce24a2e9e84ec546807ac408ae496da6d1ed41bc3ccba649623f8e19"
@@ -60,7 +60,7 @@ def _sha256(path: str) -> str:
 
 def ensure_model(logger: Optional[Callable[[str], None]] = None) -> str:
     """Returns the path of a verified YAMNet model, downloading it on first use. Raises on failure."""
-    model_dir = os.path.join(get_app_data_path(), "models")
+    model_dir = get_models_dir()
     os.makedirs(model_dir, exist_ok=True)
     path = os.path.join(model_dir, MODEL_FILENAME)
     if os.path.exists(path):

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from src.core import editor
+from src.core.transcriber import TranscriptionCancelled, TranscriptionOutput
 
 REAL_REVIEW = editor._review_clip_boundaries  # kept so the review tests can call the real function
 
@@ -413,6 +414,34 @@ def test_process_video_cancellation(tmp_path, monkeypatch):
         logger=logs.append,
         is_cancelled=lambda: True
     )
+class _FakeEngine:
+    """Stands in for transcriber.Transcriber: no GPU, no model download."""
+
+    def __init__(self, segments=None, language="en", diarized=False, error=None):
+        self.output = TranscriptionOutput(language, segments or [], diarized, sorted({x["speaker"] for x in (segments or []) if x.get("speaker")}))
+        self.error = error
+        self.closed = False
+        self.calls = []
+
+    def transcribe(self, audio, language, hf_token=None, is_cancelled=None):
+        self.calls.append({"language": language, "hf_token": hf_token})
+        if self.error:
+            raise self.error
+        return self.output
+
+    def close(self):
+        self.closed = True
+
+
+def _use_engine(monkeypatch, tmp_path, **kwargs):
+    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    token = kwargs.pop("token", None)
+    monkeypatch.setattr("src.core.editor.resolve_hf_token", lambda cfg=None: token)
+    engine = _FakeEngine(**kwargs)
+    monkeypatch.setattr("src.core.editor.Transcriber", lambda *a, **k: engine)
+    return engine
+
+
 def test_transcribe_audio_cached_hit(tmp_path, monkeypatch):
     cache_dir = tmp_path / "appdata" / "transcripts"
     cache_dir.mkdir(parents=True)
@@ -434,7 +463,8 @@ def test_transcribe_audio_cached_hit(tmp_path, monkeypatch):
 
 def test_transcribe_audio_model_load_error(tmp_path, monkeypatch):
     monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    monkeypatch.setattr("src.core.editor.whisper.load_model", MagicMock(side_effect=RuntimeError("Whisper VRAM full")))
+    monkeypatch.setattr("src.core.editor.resolve_hf_token", lambda cfg=None: None)
+    monkeypatch.setattr("src.core.editor.Transcriber", MagicMock(side_effect=RuntimeError("Whisper VRAM full")))
 
     video = tmp_path / "video.mp4"
     video.write_text("dummy")
@@ -443,13 +473,11 @@ def test_transcribe_audio_model_load_error(tmp_path, monkeypatch):
     config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {}}
     result = editor._transcribe_audio_to_segments(str(video), config, logger=logs.append, is_cancelled=None)
     assert result is None
-    assert any("Failed to load Whisper" in line for line in logs)
+    assert any("Failed to load WhisperX" in line for line in logs)
 
 
 def test_transcribe_audio_extraction_error(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    mock_model = MagicMock()
-    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *args, **kwargs: mock_model)
+    engine = _use_engine(monkeypatch, tmp_path)
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", MagicMock(side_effect=RuntimeError("Audio corrupted")))
 
     video = tmp_path / "video.mp4"
@@ -460,15 +488,11 @@ def test_transcribe_audio_extraction_error(tmp_path, monkeypatch):
     result = editor._transcribe_audio_to_segments(str(video), config, logger=logs.append, is_cancelled=None)
     assert result is None
     assert any("Audio extraction error" in line for line in logs)
+    assert engine.closed  # the model is released even when the run fails
 
 
 def test_transcribe_audio_full_success(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    mock_model = MagicMock()
-    mock_model.transcribe.return_value = {
-        "segments": [{"start": 0.0, "end": 5.0, "text": "GG WP"}]
-    }
-    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *args, **kwargs: mock_model)
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "GG WP"}])
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
 
     video = tmp_path / "video.mp4"
@@ -479,6 +503,7 @@ def test_transcribe_audio_full_success(tmp_path, monkeypatch):
     result = editor._transcribe_audio_to_segments(str(video), config, logger=logs.append, is_cancelled=None)
     assert result is not None
     assert len(result) == 1
+    assert engine.calls == [{"language": None, "hf_token": None}] and engine.closed
 
 
 # ==============================================================================
@@ -683,13 +708,10 @@ def test_process_video_cancel_after_llm(tmp_path, monkeypatch):
 # TRANSCRIPTION: EVENTS, WORD TIMESTAMPS, CACHE VERSION
 # ==============================================================================
 def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    mock_model = MagicMock()
-    mock_model.transcribe.return_value = {"segments": [{
-        "id": 0, "seek": 0, "tokens": [1, 2, 3], "start": 0.0, "end": 5.0, "text": " GG WP",
-        "words": [{"word": " GG", "start": 0.1, "end": 0.6, "probability": 0.9}],
-    }]}
-    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *a, **k: mock_model)
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{
+        "start": 0.0, "end": 5.0, "text": " GG WP", "speaker": "SPEAKER_01", "extra": "dropped",
+        "words": [{"word": " GG", "start": 0.1, "end": 0.6, "score": 0.9, "speaker": "SPEAKER_01"}, {"word": "WP"}],
+    }], diarized=True, token="hf_x")
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000 * 10, dtype=np.float32))
     monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio, **kw: [
         {"type": "LAUGHTER", "start": 1.0, "end": 4.0, "strength": 80}])
@@ -699,10 +721,11 @@ def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
     config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"}, "settings": {"audio_peak_detection": True, "combat_detection": False}}
     result = editor._transcribe_audio_to_segments(str(video), config, logger=None, is_cancelled=None)
 
-    assert mock_model.transcribe.call_args[1]["word_timestamps"] is True
+    assert engine.calls == [{"language": None, "hf_token": "hf_x"}]
     assert sorted(bool(e.get("event")) for e in result) == [False, True]
     speech = next(e for e in result if not e.get("event"))
-    assert "tokens" not in speech and speech["words"] == [{"word": " GG", "start": 0.1, "end": 0.6}]
+    assert "extra" not in speech and speech["speaker"] == "SPEAKER_01"
+    assert speech["words"] == [{"word": " GG", "start": 0.1, "end": 0.6}]  # untimed words and per-word scores are dropped
     assert "loudness" in speech
 
 
@@ -716,11 +739,12 @@ def test_event_detection_failure_is_not_fatal(monkeypatch):
     assert any("skipped" in line for line in logs)
 
 
-def test_transcript_cache_key_is_versioned(tmp_path, monkeypatch):
+def test_transcript_cache_key_is_versioned_and_knows_about_speakers(tmp_path, monkeypatch):
     monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path))
     video = tmp_path / "v.mp4"
     video.write_text("x")
     before = editor._get_transcription_cache_path(str(video), "base", "en", True, True)
+    assert editor._get_transcription_cache_path(str(video), "base", "en", True, True, diarize=True) != before  # a token appeared: do not reuse the speaker-less transcript
     monkeypatch.setattr("src.core.editor.TRANSCRIPT_CACHE_VERSION", editor.TRANSCRIPT_CACHE_VERSION + 1)
     assert editor._get_transcription_cache_path(str(video), "base", "en", True, True) != before
 
@@ -762,79 +786,12 @@ def test_generation_stops_after_consecutive_window_failures(monkeypatch):
 # ==============================================================================
 # LEGACY (pre-v2) TRANSCRIPT CACHE MIGRATION
 # ==============================================================================
-def test_migrate_legacy_segments_strips_baked_in_tags():
-    legacy = [
-        {"id": 0, "start": 0.0, "end": 2.0, "text": "[LOUDNESS: 42%] [ACTION: COMBAT]  Привет", "tokens": [1, 2], "rms": 0.1},
-        {"start": 2.0, "end": 4.0, "text": " no tags here"},
-        {"start": 4.0, "text": "broken"},
-        "junk",
-    ]
-    migrated = editor._migrate_legacy_segments(legacy)
-    assert [s["text"].strip() for s in migrated] == ["Привет", "no tags here"]
-    assert all(set(s) == {"start", "end", "text"} for s in migrated)
-
-
-def test_legacy_cache_is_upgraded_without_running_whisper(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    video = tmp_path / "video.mp4"
-    video.write_text("dummy")
-
-    legacy_file = editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True)
-    new_file = editor._get_transcription_cache_path(str(video), "base", "ru", True, True)
-    assert legacy_file != new_file
-    editor._save_cached_segments(legacy_file, [{"start": 0.0, "end": 5.0, "text": "[LOUDNESS: 80%] GG WP"}])
-
-    load_model = MagicMock()
-    monkeypatch.setattr("src.core.editor.whisper.load_model", load_model)
-    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.full(16000 * 10, 0.05, dtype=np.float32))
-    monkeypatch.setattr("src.core.editor.audio_events.detect_audio_events", lambda audio, **kw: [
-        {"type": "LAUGHTER", "start": 5.0, "end": 8.0, "strength": 60}])
-
-    logs = []
-    config = {"openai": {"whisper_model": "base", "whisper_language": "Russian"}, "settings": {"audio_peak_detection": True, "combat_detection": True}}
-    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
-
-    load_model.assert_not_called()
-    assert [bool(e.get("event")) for e in result] == [False, True]
-    assert result[0]["text"].strip() == "GG WP" and "loudness" in result[0]
-    assert os.path.exists(new_file)
-    assert any("older cached transcript" in line for line in logs)
-
-    again = editor._transcribe_audio_to_segments(str(video), config, logs.append, None)  # now served from the v2 cache
-    assert again == result
-
-
-def test_legacy_migration_falls_back_to_whisper_when_audio_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    video = tmp_path / "video.mp4"
-    video.write_text("dummy")
-    editor._save_cached_segments(editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True),
-                                 [{"start": 0.0, "end": 5.0, "text": "x"}])
-    monkeypatch.setattr("src.core.editor.extract_audio_hidden", MagicMock(side_effect=RuntimeError("ffmpeg died")))
-    logs = []
-    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, logs.append, None) is None
-    assert any("transcribing from scratch" in line for line in logs)
-
-
-def test_legacy_migration_noop_without_legacy_file_and_cancel(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
-    video = tmp_path / "video.mp4"
-    video.write_text("dummy")
-    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, None, None) is None
-    editor._save_cached_segments(editor._get_transcription_cache_path(str(video), "base", "ru", True, True, legacy=True),
-                                 [{"start": 0.0, "end": 5.0, "text": "x"}])
-    assert editor._migrate_legacy_cache(str(video), "unused.json", "base", "ru", True, True, None, lambda: True) == []
-
-
-def test_get_whisper_models_lists_everything_the_library_can_load(monkeypatch):
+def test_get_whisper_models_lists_everything_the_library_can_load():
     models = editor.get_whisper_models()
-    assert {"tiny", "base", "small", "medium", "large-v3", "turbo", "large-v3-turbo", "large-v2", "tiny.en"} <= set(models)
+    assert {"tiny", "base", "small", "medium", "large-v3", "turbo", "large-v3-turbo", "large-v2", "tiny.en", "distil-large-v3"} <= set(models)
     assert len(models) == len(set(models))
-    assert editor.get_whisper_models("my-local.pt")[-1] == "my-local.pt"
+    assert editor.get_whisper_models("my-local-model")[-1] == "my-local-model"
     assert editor.get_whisper_models("large-v3").count("large-v3") == 1
-
-    monkeypatch.setattr("src.core.editor.whisper.available_models", MagicMock(side_effect=RuntimeError("broken")))
-    assert editor.get_whisper_models("base") == editor.FALLBACK_WHISPER_MODELS
 
 
 # ==============================================================================
@@ -953,18 +910,6 @@ def test_only_overlapping_nominations_merge_back_to_back_moments_stay_separate()
     assert len(editor._clean_and_merge_clips(too_long)) == 2
 
 
-def test_whisper_triton_fallback_warning_is_silenced():
-    import importlib
-    import warnings
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("default")
-        importlib.reload(editor)  # re-runs the module-level filter registration inside this warnings context
-        warnings.warn("Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower DTW implementation...", UserWarning)
-        warnings.warn("some other warning", UserWarning)
-    assert [str(w.message) for w in caught] == ["some other warning"]
-
-
 # ==============================================================================
 # LOGGING: THE USER MUST BE ABLE TO SEE WHETHER THE SOUND MODEL IS USED
 # ==============================================================================
@@ -1001,39 +946,84 @@ def test_llm_stage_logs_the_audio_tags_it_sends(monkeypatch):
     editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", logs.append)
     assert any("Audio event tags included in the AI prompts: LAUGHTER: 1, SCREAM: 1" in line for line in logs)
     prompt = mock_client.chat.completions.create.call_args[1]["messages"][1]["content"]
-    assert "[LAUGHTER 55%]" in prompt and "[SCREAM 40%]" in prompt  # and they really are in the text the model reads
+    assert '"event":"LAUGHTER"' in prompt and '"strength":55' in prompt and '"event":"SCREAM"' in prompt  # and they really are in the text the model reads
 
 
 # ==============================================================================
 # CANCELLATION
 # ==============================================================================
 def test_cancel_interrupts_a_running_whisper_transcription(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.editor.get_app_data_path", lambda: str(tmp_path / "appdata"))
+    engine = _use_engine(monkeypatch, tmp_path, error=TranscriptionCancelled())
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000 * 10, dtype=np.float32))
-    printed = {"segments": 0}
-    state = {"cancel": False}
-
-    def fake_transcribe(audio, **kwargs):
-        for i in range(1000):  # what whisper does with verbose=True: print every segment as it is decoded
-            print(f"[00:{i % 60:02d}.000 --> 00:{i % 60 + 1:02d}.000] segment {i}")
-            printed["segments"] += 1
-            if printed["segments"] == 3:
-                state["cancel"] = True  # the user presses Cancel
-        return {"segments": []}
-
-    mock_model = MagicMock()
-    mock_model.transcribe.side_effect = fake_transcribe
-    monkeypatch.setattr("src.core.editor.whisper.load_model", lambda *a, **k: mock_model)
     video = tmp_path / "video.mp4"
     video.write_text("dummy")
     logs = []
     config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {}}
-    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, lambda: state["cancel"])
-    assert result is None
-    assert printed["segments"] == 3  # stopped right away instead of decoding all 1000
+    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, lambda: bool(engine.calls))  # the user presses Cancel while WhisperX runs
+    assert result is None and len(engine.calls) == 1
     assert any("Transcription cancelled" in line for line in logs)
     assert not any("Transcription error" in line for line in logs)
-    assert not any(cache_file.endswith(".json") for cache_file in os.listdir(tmp_path / "appdata" / "transcripts")) if (tmp_path / "appdata" / "transcripts").exists() else True
+    assert engine.closed
+    assert not (tmp_path / "appdata" / "transcripts").exists() or not os.listdir(tmp_path / "appdata" / "transcripts")
+
+
+def test_transcript_cache_switch_off_neither_reads_nor_writes(tmp_path, monkeypatch):
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "fresh"}])
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    cache_file = editor._get_transcription_cache_path(str(video), "base", "en", True, True)
+    editor._save_cached_segments(cache_file, [{"start": 0.0, "end": 5.0, "text": "stale"}])
+    before = open(cache_file, encoding="utf-8").read()
+
+    logs = []
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {"use_transcript_cache": False}}
+    result = editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+    assert result[0]["text"] == "fresh" and len(engine.calls) == 1  # the cached "stale" transcript was ignored
+    assert open(cache_file, encoding="utf-8").read() == before  # and nothing was written
+    assert any("cache is OFF" in line for line in logs)
+
+    config["settings"]["use_transcript_cache"] = True  # the default: cache used
+    assert editor._transcribe_audio_to_segments(str(video), config, None, None)[0]["text"] == "stale"
+    assert len(engine.calls) == 1
+
+
+def test_transcript_is_cached_as_a_document_with_speakers(tmp_path, monkeypatch):
+    segments = [{"start": 0.0, "end": 5.0, "text": "a", "speaker": "SPEAKER_00"}, {"start": 5.0, "end": 8.0, "text": "b", "speaker": "SPEAKER_01"}]
+    engine = _use_engine(monkeypatch, tmp_path, segments=segments, diarized=True, token="hf_x", language="ru")
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"}, "settings": {"audio_peak_detection": False, "combat_detection": False}}
+
+    first = editor._transcribe_audio_to_segments(str(video), config, None, None)
+    assert [s["speaker"] for s in first] == ["SPEAKER_00", "SPEAKER_01"]
+    cache_file = editor._get_transcription_cache_path(str(video), "base", None, False, False, diarize=True)
+    document = json.load(open(cache_file, encoding="utf-8"))
+    assert document["version"] == editor.TRANSCRIPT_CACHE_VERSION and document["engine"] == "whisperx"
+    assert document["diarized"] is True and document["speakers"] == ["SPEAKER_00", "SPEAKER_01"] and document["language"] == "ru"
+
+    assert editor._transcribe_audio_to_segments(str(video), config, None, None) == first
+    assert len(engine.calls) == 1  # second run came from the cache
+
+
+def test_transcript_without_speakers_is_not_cached_when_a_token_was_set(tmp_path, monkeypatch):
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "a"}], diarized=False, token="hf_bad")
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {"audio_peak_detection": False, "combat_detection": False}}
+    logs = []
+    assert editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+    assert any("Not cached" in line for line in logs)
+    editor._transcribe_audio_to_segments(str(video), config, None, None)
+    assert len(engine.calls) == 2  # tried again (the token may be fixed by now)
+
+
+def test_old_list_style_cache_files_are_ignored(tmp_path):
+    cache_file = tmp_path / "old.json"
+    cache_file.write_text('[{"start": 0.0, "end": 1.0, "text": "x"}]', encoding="utf-8")
+    assert editor._load_cached_segments(str(cache_file)) is None
 
 
 def test_process_video_does_not_export_after_cancel_during_boundary_snapping(tmp_path, monkeypatch):
@@ -1102,10 +1092,11 @@ def test_review_extends_a_clip_that_lacked_its_setup_and_shows_marked_context(mo
     assert any("1 of 1 clip(s) adjusted" in line for line in logs)
     prompt = prompts[0]
     assert "from 115.0s to 160.0s" in prompt and "STEP 1" in prompt and "STEP 2" in prompt
-    marked = [line for line in prompt.splitlines() if line.startswith("> ")]
-    assert marked and all(115 - 5 < float(line.split("[")[1].split("s")[0]) < 160 for line in marked)
-    assert any(line.startswith("  [") for line in prompt.splitlines())  # context lines are unmarked
-    assert "[65.0s" not in prompt and "[210.0s" not in prompt  # only +-45 s of context around 115-160
+    rows = [json.loads(line) for line in prompt.splitlines() if line.startswith("{")]
+    marked = [r for r in rows if r.get("in_clip")]
+    assert marked and all(115 - 5 < r["start"] < 160 for r in marked)
+    assert any(not r.get("in_clip") for r in rows)  # context lines are unmarked
+    assert min(r["start"] for r in rows) >= 70.0 and max(r["end"] for r in rows) <= 205.0  # only +-45 s of context around 115-160
 
 
 def test_review_drops_a_scene_about_another_topic(monkeypatch):
@@ -1579,8 +1570,8 @@ def test_format_duration():
 
 
 def test_prompts_explain_the_pause_markers_and_the_closing_remark():
-    assert "⏸" in editor.WINDOW_PROMPT and "continuous speech" in editor.WINDOW_PROMPT
-    assert "⏸" in editor.REVIEW_PROMPT and "closing remark" in editor.REVIEW_PROMPT
+    assert "pause_before" in editor.WINDOW_PROMPT and "continuous speech" in editor.WINDOW_PROMPT and "speaker" in editor.WINDOW_PROMPT
+    assert "pause_before" in editor.REVIEW_PROMPT and "in_clip" in editor.REVIEW_PROMPT and "closing remark" in editor.REVIEW_PROMPT
     assert "one line too early feels cut off" in editor.REVIEW_PROMPT
 
 
@@ -1596,7 +1587,7 @@ def test_window_transcripts_carry_pause_markers(monkeypatch):
     monkeypatch.setattr("src.core.editor.OpenAI", lambda **kwargs: mock_client)
     segments = [{"start": 0.0, "end": 3.0, "text": "a."}, {"start": 5.0, "end": 8.0, "text": "b."}]
     editor._generate_clips_with_llm(segments, {"openai": {"api_key": "k"}}, "gpt-5.5", "P", None)
-    assert "⏸ 2.0s" in prompts[0]
+    assert '"pause_before":2.0' in prompts[0]
 
 
 def test_process_video_finishes_a_sentence_the_ai_cut_in_half(tmp_path, monkeypatch):

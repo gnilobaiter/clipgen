@@ -53,3 +53,8 @@ dummy_clips/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local data: downloaded AI models (several GB), transcript cache, logs
+data/
+# API keys and HuggingFace token
+/config.json

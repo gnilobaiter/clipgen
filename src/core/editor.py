@@ -1,28 +1,22 @@
-import contextlib
 import hashlib
-import io
 import json
 import os
 import re
 import subprocess
 import time
-import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from openai import OpenAI
-import whisper
 
 from src.core import audio_events, cuts, highlights
 from src.core import config as config_manager
+from src.core import transcriber as whisper_backend
+from src.core.transcriber import TranscriptionCancelled, Transcriber, resolve_hf_token
 from src.utils.hardware import get_hardware_status, log_hardware_info
 from src.utils.log_style import stage_header
 from src.utils.paths import get_app_data_path, get_ffmpeg_path, get_ffprobe_path, inject_bin_to_path
-
-# openai-whisper tries Triton GPU kernels for word timestamps (median filter, DTW). Triton does not exist on Windows,
-# so whisper falls back to slower but equivalent implementations and warns once per 30 s of audio. Harmless noise.
-warnings.filterwarnings("ignore", message="Failed to launch Triton kernels", category=UserWarning)
 
 inject_bin_to_path()
 FFMPEG_PATH = get_ffmpeg_path()
@@ -42,38 +36,6 @@ try:
     HAS_ANTHROPIC = True
 except ImportError:
     HAS_ANTHROPIC = False
-
-class TranscriptionCancelled(Exception):
-    """Raised from inside Whisper's progress printing to abort a running transcription."""
-
-
-class WhisperProgressStream(io.StringIO):
-    def __init__(self, logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]] = None):
-        super().__init__()
-        self.logger = logger
-        self.is_cancelled = is_cancelled
-        self.counter = 0
-
-    def write(self, s: str) -> int:
-        # whisper.transcribe() has no cancel hook, but with verbose=True it prints every segment to stdout,
-        # which is redirected here: raising from this print is the only way to stop a running transcription.
-        if self.is_cancelled and self.is_cancelled():
-            raise TranscriptionCancelled()
-        raw_msg = s.strip()
-        if raw_msg and "-->" in raw_msg:
-            # Throttle to log only every 10th segment to prevent UI spam lag
-            if self.counter % 10 == 0:
-                if "]" in raw_msg:
-                    t_part, _, clean_msg = raw_msg.partition("]")
-                    clean_msg = clean_msg.strip()
-                    timestamp = t_part.replace("[", "").partition("-->")[0].strip()
-                else:
-                    clean_msg = raw_msg
-                    timestamp = raw_msg.partition("-->")[0].strip()
-                if self.logger:
-                    self.logger(f"⏳ Processed up to {timestamp}: {clean_msg[:40]}...")
-            self.counter += 1
-        return super().write(s)
 
 # Peak/mean RMS ratio of a segment that counts as a gunshot/explosion transient. Calibrated on a real 90-min VOD:
 # 3.5 flagged 61% of all lines (plain speech plosives), 8.0 flags the sharpest ~7%.
@@ -528,47 +490,51 @@ def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
         return _clean_and_merge_clips(data)
     return None
 
-# Bump when the cached segment layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds; v4: YAMNet laughter/scream classifier replaces the modulation heuristic; v5: calibrated combat threshold)
-TRANSCRIPT_CACHE_VERSION = 5
+# Bump when the cached transcript layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds; v4: YAMNet laughter/scream classifier replaces the modulation heuristic; v5: calibrated combat threshold; v6: WhisperX engine, wav2vec2 word alignment, speaker labels, document layout)
+TRANSCRIPT_CACHE_VERSION = 6
+TRANSCRIPT_ENGINE = "whisperx"
 
 
-def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool, legacy: bool = False) -> str:
+def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool, diarize: bool = False) -> str:
     """Computes a deterministic hash and cache file path for audio transcriptions.
-    `legacy=True` gives the path of the pre-v2 cache entry (no version prefix in the key)."""
+    `diarize` (a HuggingFace token is available) is part of the key so a transcript cached without speakers is not reused once speakers can be labelled."""
     try:
         mtime = os.path.getmtime(file_path)
         size = os.path.getsize(file_path)
     except Exception:
         mtime, size = 0, 0
-    
-    version_prefix = "" if legacy else f"v{TRANSCRIPT_CACHE_VERSION}_"
-    cache_key = f"{version_prefix}{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}"
+
+    cache_key = f"v{TRANSCRIPT_CACHE_VERSION}_{TRANSCRIPT_ENGINE}_{os.path.abspath(file_path)}_{mtime}_{size}_{whisper_model}_{target_language}_{audio_peak}_{combat}_{diarize}"
     file_hash = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
-    
+
     cache_dir = os.path.join(get_app_data_path(), "transcripts")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"{file_hash}.json")
 
 def _load_cached_segments(cache_file: str, logger: Optional[Callable[[str], None]] = None) -> Optional[List[Dict[str, Any]]]:
-    """Attempts to load previously generated transcription segments from disk cache."""
+    """Attempts to load a previously generated transcript document ({version, model, language, diarized, speakers, segments}) from disk."""
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
-                segments = json.load(f)
-                if isinstance(segments, list) and segments:
-                    if logger:
-                        logger(f"⚡ Loaded {len(segments)} cached audio segments from disk! (Skipping Whisper transcription)")
-                    return segments
+                document = json.load(f)
+            segments = document.get("segments") if isinstance(document, dict) else None
+            if isinstance(segments, list) and segments and document.get("version") == TRANSCRIPT_CACHE_VERSION:
+                if logger:
+                    speakers = document.get("speakers") or []
+                    logger(f"⚡ Loaded {len(segments)} cached audio segments from disk ({len(speakers)} speaker(s))! (Skipping Whisper transcription)")
+                return segments
         except Exception as e:
             if logger:
                 logger(f"⚠️ Cache read error: {e}")
     return None
 
-def _save_cached_segments(cache_file: str, segments: List[Dict[str, Any]], logger: Optional[Callable[[str], None]] = None) -> None:
-    """Saves transcription segments to disk cache for instant reuse on subsequent runs."""
+def _save_cached_segments(cache_file: str, segments: List[Dict[str, Any]], logger: Optional[Callable[[str], None]] = None,
+                          meta: Optional[Dict[str, Any]] = None) -> None:
+    """Saves the transcript document to disk cache for instant reuse on subsequent runs."""
+    document = {"version": TRANSCRIPT_CACHE_VERSION, "engine": TRANSCRIPT_ENGINE, **(meta or {}), "segments": segments}
     try:
         with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(segments, f, ensure_ascii=False, indent=2)
+            json.dump(document, f, ensure_ascii=False, indent=2)
         if logger:
             logger(f"💾 Cached transcription to disk ({len(segments)} segments).")
     except Exception as e:
@@ -576,34 +542,18 @@ def _save_cached_segments(cache_file: str, segments: List[Dict[str, Any]], logge
             logger(f"⚠️ Failed to cache transcription: {e}")
 
 def _slim_segments(raw_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keeps only what the pipeline needs (Whisper's token arrays would bloat the disk cache)."""
+    """Keeps only what the pipeline needs (WhisperX's per-word scores would bloat the disk cache)."""
     slim = []
     for seg in raw_segments:
-        entry: Dict[str, Any] = {"start": float(seg["start"]), "end": float(seg["end"]), "text": str(seg.get("text", ""))}
+        entry: Dict[str, Any] = {"start": float(seg["start"]), "end": float(seg["end"]), "text": str(seg.get("text", "")).strip()}
+        if seg.get("speaker"):
+            entry["speaker"] = str(seg["speaker"])
         words = [{"word": w.get("word", ""), "start": float(w["start"]), "end": float(w["end"])}
                  for w in seg.get("words", []) or [] if "start" in w and "end" in w]
         if words:
             entry["words"] = words
         slim.append(entry)
     return slim
-
-
-_LEGACY_TAGS = re.compile(r"^\s*((?:\[LOUDNESS: \d+%\]|\[ACTION: COMBAT\])\s*)+")
-
-
-def _migrate_legacy_segments(legacy: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Turns a pre-v2 cache entry (audio tags baked into `text`, global-max loudness) back into clean Whisper
-    segments so the expensive transcription is not repeated. Loudness/events are recomputed from the audio."""
-    clean = []
-    for seg in legacy:
-        if not isinstance(seg, dict) or "start" not in seg or "end" not in seg:
-            continue
-        text = str(seg.get("text", ""))
-        match = _LEGACY_TAGS.match(text)
-        if match:
-            text = text[match.end():]
-        clean.append({"start": seg["start"], "end": seg["end"], "text": text})
-    return _slim_segments(clean)
 
 
 def _annotate_with_audio(audio_array: np.ndarray, raw_segments: List[Dict[str, Any]], audio_peak_detection: bool,
@@ -642,16 +592,10 @@ def _detect_events_safe(audio_array: np.ndarray, logger: Optional[Callable[[str]
     return [{"start": ev["start"], "end": ev["end"], "text": "", "event": ev["type"], "strength": ev["strength"]} for ev in detected]
 
 
-FALLBACK_WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
-
-
 def get_whisper_models(current: Optional[str] = None) -> List[str]:
-    """Every model the installed openai-whisper can load (tiny.en ... large-v3-turbo), so the UI never drifts
-    from the library. A saved custom value (e.g. a local .pt path) is kept selectable."""
-    try:
-        models = list(whisper.available_models())
-    except Exception:
-        models = list(FALLBACK_WHISPER_MODELS)
+    """Every model faster-whisper / WhisperX can load (tiny.en ... large-v3-turbo, distil-*), so the UI never drifts
+    from the library. A saved custom value (e.g. a local model path) is kept selectable."""
+    models = whisper_backend.available_models()
     if current and current not in models:
         models.append(current)
     return models
@@ -674,28 +618,6 @@ LANGUAGE_MAP = {
     "Turkish": "tr"
 }
 
-def _migrate_legacy_cache(file_path: str, cache_file: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool,
-                          logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]]) -> Optional[List[Dict[str, Any]]]:
-    """Upgrades a pre-v2 transcript cache entry (audio extraction only, no Whisper). None = nothing to migrate / fall back to Whisper; [] = cancelled."""
-    legacy_file = _get_transcription_cache_path(file_path, whisper_model, target_language, audio_peak, combat, legacy=True)
-    legacy = _load_cached_segments(legacy_file, None)
-    if legacy is None:
-        return None
-    raw_segments = _migrate_legacy_segments(legacy)
-    if not raw_segments:
-        return None
-    if logger: logger(f"♻️ Found an older cached transcript ({len(raw_segments)} segments) - reusing the Whisper text, re-analysing the audio only...")
-    if is_cancelled and is_cancelled(): return []
-    try:
-        audio_array = extract_audio_hidden(file_path)
-        segments = _annotate_with_audio(audio_array, raw_segments, audio_peak, combat, logger)
-    except Exception as e:
-        if logger: logger(f"⚠️ Could not upgrade the older cache ({e}); transcribing from scratch.")
-        return None
-    _save_cached_segments(cache_file, segments, logger)
-    return segments
-
-
 def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger: Optional[Callable[[str], None]], is_cancelled: Optional[Callable[[], bool]]) -> Optional[List[Dict[str, Any]]]:
     whisper_model_type = config.get("openai", {}).get("whisper_model", "medium")
     language_setting = config.get("openai", {}).get("whisper_language", "Auto-Detect")
@@ -707,85 +629,76 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
     else:
         target_language = language_setting.lower() if len(language_setting) == 2 else language_setting[:2].lower()
 
-    audio_peak_detection = config.get("settings", {}).get("audio_peak_detection", True)
-    combat_detection = config.get("settings", {}).get("combat_detection", True)
+    settings_cfg = config.get("settings", {})
+    audio_peak_detection = settings_cfg.get("audio_peak_detection", True)
+    combat_detection = settings_cfg.get("combat_detection", True)
+    use_cache = bool(settings_cfg.get("use_transcript_cache", True))
+    hf_token = resolve_hf_token(config)
 
-    cache_file = _get_transcription_cache_path(file_path, whisper_model_type, target_language, audio_peak_detection, combat_detection)
-    cached_segments = _load_cached_segments(cache_file, logger)
-    if cached_segments is not None:
-        if logger: logger(f"🔊 Audio events stored in the cache: {_format_event_counts(cached_segments)} (sound classifier not re-run).")
-        return cached_segments
-
-    migrated = _migrate_legacy_cache(file_path, cache_file, whisper_model_type, target_language, audio_peak_detection, combat_detection, logger, is_cancelled)
-    if migrated is not None:
-        return migrated
+    cache_file: Optional[str] = None
+    if use_cache:
+        cache_file = _get_transcription_cache_path(file_path, whisper_model_type, target_language, audio_peak_detection, combat_detection, diarize=bool(hf_token))
+        cached_segments = _load_cached_segments(cache_file, logger)
+        if cached_segments is not None:
+            if logger: logger(f"🔊 Audio events stored in the cache: {_format_event_counts(cached_segments)} (sound classifier not re-run).")
+            return cached_segments
+    elif logger:
+        logger("🚫 Transcript cache is OFF (Settings): transcribing from scratch, nothing will be saved.")
 
     # Hardware check & detailed status logging
     log_hardware_info(logger)
-    hw_status = get_hardware_status()
-    device = hw_status["device"]
-    fp16_enabled = hw_status["fp16_supported"]
+    device = get_hardware_status()["device"]
 
-    if logger: logger(f"⏳ Loading Whisper '{whisper_model_type}' model into memory...")
+    if logger: logger(f"⏳ Loading WhisperX '{whisper_model_type}' model into memory (a missing model is downloaded to data/models/whisper)...")
     try:
-        model = whisper.load_model(whisper_model_type, device=device)
+        engine = Transcriber(whisper_model_type, device, logger)
     except Exception as e:
-        if logger: logger(f"❌ Failed to load Whisper: {e}")
+        if logger: logger(f"❌ Failed to load WhisperX: {e}")
         return None
 
-    if is_cancelled and is_cancelled(): return None
-    
-    if logger: logger("🎙️ Extracting audio track silently...")
     try:
-        audio_array = extract_audio_hidden(file_path)
-    except Exception as e:
-        if logger: logger(f"❌ Audio extraction error: {e}")
-        return None
+        if is_cancelled and is_cancelled(): return None
 
-    if is_cancelled and is_cancelled(): return None
+        if logger: logger("🎙️ Extracting audio track silently...")
+        try:
+            audio_array = extract_audio_hidden(file_path)
+        except Exception as e:
+            if logger: logger(f"❌ Audio extraction error: {e}")
+            return None
 
-    lang_desc = target_language if target_language else "Auto-Detect"
-    if logger:
-        if audio_peak_detection or combat_detection:
-            logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}] and analyzing sound patterns...")
-        else:
-            logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}]...")
-            
-    try:
-        progress_stream = WhisperProgressStream(logger, is_cancelled)
-        with contextlib.redirect_stdout(progress_stream):
-            transcribe_kwargs: Dict[str, Any] = {
-                "condition_on_previous_text": False,
-                "beam_size": 5 if device == "cuda" else 2,
-                "best_of": 5 if device == "cuda" else 2,
-                "temperature": (0.0, 0.2, 0.4),
-                "fp16": fp16_enabled,
-                "verbose": True,
-                "word_timestamps": True,
-                "hallucination_silence_threshold": 2.0,
-                "initial_prompt": "Gameplay livestream recording with conversational banter, laughter, discord chat, and gaming terms."
-            }
-            if target_language is not None:
-                transcribe_kwargs["language"] = target_language
+        if is_cancelled and is_cancelled(): return None
 
-            result = model.transcribe(audio_array, **transcribe_kwargs)
-            
-        raw_segments = _slim_segments(result.get("segments", []))
-
-        segments = _annotate_with_audio(audio_array, raw_segments, audio_peak_detection, combat_detection, logger)
+        lang_desc = target_language if target_language else "Auto-Detect"
         if logger:
-            logger("✅ Transcription complete! Audio patterns analyzed." if (audio_peak_detection or combat_detection) else "✅ Transcription complete!")
+            suffix = " and analyzing sound patterns" if (audio_peak_detection or combat_detection) else ""
+            logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}, speakers: {'on' if hf_token else 'no token'}]{suffix}...")
 
-        if segments:
-            _save_cached_segments(cache_file, segments, logger)
-        return segments
+        try:
+            output = engine.transcribe(audio_array, target_language, hf_token, is_cancelled)
+            engine.close()  # free the VRAM before the sound classifier (a GPU process of its own) starts
+            raw_segments = _slim_segments(output.segments)
 
-    except TranscriptionCancelled:
-        if logger: logger("🛑 Transcription cancelled.")
-        return None
-    except Exception as e:
-        if logger: logger(f"❌ Transcription error: {e}")
-        return None
+            segments = _annotate_with_audio(audio_array, raw_segments, audio_peak_detection, combat_detection, logger)
+            if logger:
+                speaker_note = f" Speakers: {', '.join(output.speakers)}." if output.speakers else ""
+                logger(("✅ Transcription complete! Audio patterns analyzed." if (audio_peak_detection or combat_detection) else "✅ Transcription complete!") + speaker_note)
+
+            if segments and cache_file:
+                if (output.diarized or not hf_token) and not output.align_failed:
+                    _save_cached_segments(cache_file, segments, logger, {
+                        "model": whisper_model_type, "language": output.language, "diarized": output.diarized, "speakers": output.speakers})
+                elif logger:
+                    logger("ℹ️ Not cached: speaker labelling or word alignment failed, so the next run will try it again.")
+            return segments
+
+        except TranscriptionCancelled:
+            if logger: logger("🛑 Transcription cancelled.")
+            return None
+        except Exception as e:
+            if logger: logger(f"❌ Transcription error: {e}")
+            return None
+    finally:
+        engine.close()
 
 MAX_MERGED_CLIP_SECONDS = 150.0  # adjacent nominations of one moment are merged up to this length
 ANTHROPIC_MAX_OUTPUT_TOKENS = 8192  # per window (a handful of clips); stays under the SDK's non-streaming limit
@@ -796,10 +709,11 @@ WINDOW_PROMPT = (
     "This is part {index} of {total} of a {minutes:.0f}-minute gaming stream transcript, covering {w_start:.0f}s to {w_end:.0f}s. "
     "All timestamps are absolute seconds from the start of the video.\n"
     "{overlap_note}"
-    "Line format: [start - end] optional audio tags, then speech. [LOUDNESS: X%] = how far the line rises above the local background level "
-    "(shown only when notable); [ACTION: COMBAT] = sharp gunshot/explosion transients; standalone lines such as [LAUGHTER 80%], [SCREAM 90%] or [LOUD 60%] "
-    "were detected in the raw audio; a '⏸ 1.2s' line is a real silence between two lines (lines without one are continuous speech: never start or end a clip inside continuous speech). "
-    "(LAUGHTER/SCREAM by a pretrained sound classifier, the percentage is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
+    "Transcript format: JSON Lines, one object per line. Speech lines: {{\"speaker\": \"SPEAKER_01\", \"start\", \"end\", \"text\", optional \"loudness\": X (how far the line rises above the local background level, shown only when notable), "
+    "optional \"combat\": true (sharp gunshot/explosion transients), optional \"pause_before\": seconds of real silence before the line}}. \"speaker\" is a diarization label (a different value = a different person; it is absent when speakers could not be identified). "
+    "Lines without \"pause_before\" are continuous speech: never start or end a clip inside continuous speech. "
+    "Audio-event objects {{\"event\": \"LAUGHTER\" | \"SCREAM\" | \"LOUD\", \"start\", \"end\", \"strength\": %}} were detected in the raw audio "
+    "(LAUGHTER/SCREAM by a pretrained sound classifier, the strength is its confidence; LOUD by a loudness detector). A laugh is usually the payoff of the line(s) right BEFORE it, so include both.\n\n"
     "Return {want} candidate highlights: the {want} best distinct moments of this section, best first. Your job here is to RANK, not to gatekeep - "
     "a later step compares the candidates of all sections on one scale and drops the weak ones, but it can only choose from what you nominate. "
     "If the section has fewer real highlights, fill the remaining slots with the best of the rest and give them the low score they deserve; "
@@ -1004,7 +918,8 @@ def _generate_clips_with_llm(segments: List[Dict[str, Any]], config: Dict[str, A
 
     word_count = sum(len(str(s.get("text", "")).split()) for s in segments)
     if logger:
-        logger(f"📊 Extracted approx {int(word_count * 1.3):,} tokens ({word_count:,} words) in {len(windows)} window(s) for the AI model.")
+        prompt_chars = sum(len(highlights.format_transcript(w["lines"])) for w in windows)  # the JSON Lines text is what is really sent (overlaps included)
+        logger(f"📊 Extracted approx {prompt_chars // 3:,} tokens ({word_count:,} words) in {len(windows)} window(s) for the AI model.")
         logger(f"🤖 Routing to {route.engine_name} Engine ({chat_model}) with {len(segments)} segments...")
         logger(f"🏷️ Audio event tags included in the AI prompts: {_format_event_counts(segments)}.")
 
@@ -1126,9 +1041,10 @@ REVIEW_SYSTEM = (
 
 REVIEW_PROMPT = (
     "Below is a transcript excerpt of a gaming stream ({lo:.0f}s - {hi:.0f}s). A highlight clip was proposed from {start:.1f}s to {end:.1f}s "
-    "(lines inside it are marked with '>'). All times are absolute seconds. Line format: [start - end] tags and speech; standalone "
-    "[LAUGHTER n%] / [SCREAM n%] / [LOUD n%] lines come from an audio classifier; a '⏸ 1.2s' line is a real silence between two lines, so lines with NO "
-    "⏸ between them are continuous speech - starting or ending a clip there cuts a sentence or a reaction in half.\n\n"
+    "(lines inside it carry \"in_clip\": true). All times are absolute seconds. The transcript is JSON Lines, one object per line: speech lines have "
+    "\"speaker\" (a different label = a different person; may be absent), \"start\", \"end\", \"text\" and optional \"loudness\", \"combat\", \"pause_before\"; standalone "
+    "{{\"event\": \"LAUGHTER\" | \"SCREAM\" | \"LOUD\", ...}} objects come from an audio classifier; \"pause_before\" is a real silence in seconds before the line, so lines WITHOUT it are "
+    "continuous speech - starting or ending a clip there cuts a sentence or a reaction in half. A question and the answer of another speaker belong together.\n\n"
     "STEP 1 - split the WHOLE excerpt into consecutive scenes. A new scene starts whenever the subject of the conversation changes "
     "(a different joke, a different puzzle or game object, a different question, moving from banter to giving instructions, and so on). "
     "For every scene give start_time and end_time (only values printed on the lines), a short topic, and 'humor' 0-10 = how funny or entertaining it is "
@@ -1140,7 +1056,7 @@ REVIEW_PROMPT = (
     "merely coordinate the game. A punchline without its setup is not a clip: the range must let a stranger understand who is talking to whom and what "
     "event, question or line is being reacted to (an insult, a scream or a 'wow' needs the thing that caused it). Add a preceding scene ONLY if the punchline would be unintelligible without it: delete it in your mind - does a stranger still get the joke? Then it is not needed. Game rules, earlier attempts and earlier jokes are background, not setup; a single trigger line or one short setup scene is usually enough. "
     "The clip must also END after the closing remark that usually follows a punchline ('...and that makes total sense', 'no way', the friend's reply): "
-    "ending one line too early feels cut off. Prefer to start and end right next to a ⏸ pause. "
+    "ending one line too early feels cut off. Prefer to start and end right next to a pause (a line with \"pause_before\"). "
     "Only after that is satisfied, keep the range as tight as possible. A clip longer than 120 seconds must be entertaining throughout: if it contains "
     "slow or purely coordinating stretches, keep only the best continuous stretch.{short_note}\n\n"
     "Return strictly valid JSON: {{\"scenes\": [{{\"start_time\": <float>, \"end_time\": <float>, \"topic\": \"...\", \"humor\": <int>}}, ...], "
@@ -1204,7 +1120,7 @@ def _review_clip_boundaries(route: _LLMRoute, clips: List[Dict[str, Any]], entri
         i, clip = item
         lo, hi = clip["start_time"] - REVIEW_CONTEXT, clip["end_time"] + REVIEW_CONTEXT
         excerpt = highlights.format_transcript([e for e in entries if e["end"] > lo and e["start"] < hi],
-                                               lambda e: "> " if e["end"] > clip["start_time"] and e["start"] < clip["end_time"] else "  ")
+                                               lambda e: e["end"] > clip["start_time"] and e["start"] < clip["end_time"])
         length = clip["end_time"] - clip["start_time"]
         short_note = (f" NOTE: this clip is only {length:.0f} seconds long. Clips that short are almost always missing the situation that makes "
                       "the punchline understandable: unless it is a complete joke on its own, start EARLIER and include the scene(s) that set it up."
