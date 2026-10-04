@@ -45,6 +45,8 @@ def test_get_default_config():
     # the old numeric "typical" ranges and the 90 s cap used to be read by the model as a length to aim for
     for anchor in ("hard maximum", "15-45", "25-65", "Typical duration"):
         assert anchor not in default_prompt
+    assert config["settings"]["speaker_diarization"] is False  # opt-in: needs a HuggingFace token
+    assert config["settings"]["use_transcript_cache"] is True
     assert config["settings"]["clips_per_hour"] == 12
     assert config["settings"]["min_clip_score"] == 6
 

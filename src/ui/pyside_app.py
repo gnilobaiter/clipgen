@@ -25,6 +25,11 @@ inject_bin_to_path()
 # ==============================================================================
 # MODERN OBSIDIAN DARK THEME (QSS) — 100% CLEAN & TRANSPARENT LABELS
 # ==============================================================================
+def _asset_url(name: str) -> str:
+    """Absolute path of a bundled UI asset in the form QSS `url()` needs (forward slashes)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", name).replace("\\", "/")
+
+
 QSS_STYLESHEET = """
 QMainWindow {
     background-color: #080c14;
@@ -308,24 +313,116 @@ QPushButton.danger-btn:hover, QPushButton[class="danger-btn"]:hover {
 
 /* Checkboxes & Radios */
 QCheckBox::indicator, QRadioButton::indicator {
-    width: 16px;
-    height: 16px;
-    border-radius: 4px;
-    border: 1px solid #2d3748;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 1px solid #3b4a63;
     background-color: #080c14;
 }
 
 QRadioButton::indicator {
-    border-radius: 8px;
+    border-radius: 10px;
 }
 
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {
+    border-color: #60a5fa;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #2563eb;
+    border-color: #3b82f6;
+    image: url(__CHECK_ICON__);
+}
+
+QRadioButton::indicator:checked {
+    background-color: #2563eb;
+    border-color: #3b82f6;
+    image: url(__DOT_ICON__);
+}
+
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    background-color: #0a0e17;
+    border-color: #1a2335;
+}
+
+QCheckBox:disabled, QRadioButton:disabled {
+    color: #475569;
+}
+
+QCheckBox:focus, QRadioButton:focus {
+    outline: none;
+}
+
+QCheckBox::indicator:focus, QRadioButton::indicator:focus {
+    border-color: #93c5fd;
+}
+
+QCheckBox[class="setting-check"] {
+    color: #e2e8f0;
+    font-size: 13px;
+    font-weight: 600;
+    spacing: 8px;
+}
+
+/* Settings page */
+QLabel[class="setting-title"] {
+    color: #e2e8f0;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QLabel[class="setting-hint"] {
+    color: #7c8aa0;
+    font-size: 12px;
+}
+
+QLabel[class="error-text"] {
+    color: #fca5a5;
+    font-size: 12px;
+    padding-top: 4px;
+}
+
+QLabel:disabled {
+    color: #475569;
+}
+
+QFrame[class="divider"] {
+    background-color: #172033;
+    border: none;
+}
+
+QFrame[class="footer-bar"] {
+    background-color: #0b101b;
+    border: none;
+    border-top: 1px solid #172033;
+}
+
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+    background-color: #0a0e17;
+    border: 1px solid #141c2c;
+    color: #475569;
+}
+
+QPushButton:disabled {
+    color: #475569;
+}
+
+QSpinBox {
+    background-color: #080c14;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    color: #f1f5f9;
+    padding: 6px 10px;
+    font-size: 13px;
+}
+
+QSpinBox:hover, QSpinBox:focus {
     border-color: #3b82f6;
 }
 
-QCheckBox::indicator:checked, QRadioButton::indicator:checked {
-    background-color: #2563eb;
-    border-color: #3b82f6;
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 0px;
+    border: none;
 }
 
 /* Progress Bar */
@@ -474,7 +571,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         self.setMinimumSize(1000, 680)
 
         # Apply QSS
-        self.setStyleSheet(QSS_STYLESHEET)
+        self.setStyleSheet(QSS_STYLESHEET.replace("__CHECK_ICON__", _asset_url("check.svg")).replace("__DOT_ICON__", _asset_url("dot.svg")))
 
         # Configuration & Cache
         self.config = config_manager.load_config()
@@ -754,6 +851,14 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         input_val = self.video_input.text().strip()
         if not input_val:
             self.log_to_console("❌ Input Required: Please select a valid video file.", "manual")
+            return
+
+        if self._speaker_token_missing(self.config):
+            self.log_to_console(editor.SPEAKER_TOKEN_MESSAGE, "manual")
+            QtWidgets.QMessageBox.warning(
+                self, "HuggingFace token required",
+                "Speaker detection is on, but no HuggingFace token is set.\n\nOpen Settings -> Speaker detection and paste a "
+                "token (see the README for how to get one), or switch speaker detection off, then press Save.")
             return
 
         profile = self.extractor_profile_combo.currentText()
@@ -1060,10 +1165,84 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
     # ==============================================================================
     # PAGE 2: APPLICATION CONFIGURATION (MODERN UN-NESTED HUB)
     # ==============================================================================
+    # ------------------------------------------------------------------
+    # Settings page building blocks
+    # ------------------------------------------------------------------
+    def _settings_card(self, parent, title: str, subtitle: str = ""):
+        """A titled card; rows are added to the returned layout."""
+        card = QtWidgets.QFrame(parent)
+        card.setProperty("class", "card")
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(0)
+        heading = QtWidgets.QLabel(title, card)
+        heading.setProperty("class", "card-title")
+        lay.addWidget(heading)
+        if subtitle:
+            sub = QtWidgets.QLabel(subtitle, card)
+            sub.setProperty("class", "setting-hint")
+            sub.setWordWrap(True)
+            lay.addSpacing(2)
+            lay.addWidget(sub)
+        lay.addSpacing(10)
+        return card, lay
+
+    @staticmethod
+    def _divider(parent) -> QtWidgets.QFrame:
+        line = QtWidgets.QFrame(parent)
+        line.setProperty("class", "divider")
+        line.setFixedHeight(1)
+        return line
+
+    def _setting_row(self, parent, title: str, hint: str, control: QtWidgets.QWidget, control_width: int = 300):
+        """Label + explanation on the left, the control on the right. Returns (row widget, hint label)."""
+        row = QtWidgets.QWidget(parent)
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 12, 0, 12)
+        h.setSpacing(24)
+        text = QtWidgets.QVBoxLayout()
+        text.setSpacing(2)
+        title_label = QtWidgets.QLabel(title, row)
+        title_label.setProperty("class", "setting-title")
+        text.addWidget(title_label)
+        hint_label = QtWidgets.QLabel(hint, row)
+        hint_label.setProperty("class", "setting-hint")
+        hint_label.setWordWrap(True)
+        hint_label.setVisible(bool(hint))
+        text.addWidget(hint_label)
+        h.addLayout(text, 1)
+        if control_width:
+            control.setFixedWidth(control_width)
+        h.addWidget(control, 0, QtCore.Qt.AlignTop)
+        return row, hint_label
+
+    def _toggle_row(self, parent, checkbox: QtWidgets.QCheckBox, hint: str) -> QtWidgets.QWidget:
+        """A checkbox whose text is the setting name, with an explanation under it."""
+        row = QtWidgets.QWidget(parent)
+        v = QtWidgets.QVBoxLayout(row)
+        v.setContentsMargins(0, 12, 0, 12)
+        v.setSpacing(3)
+        checkbox.setProperty("class", "setting-check")
+        checkbox.setCursor(QtCore.Qt.PointingHandCursor)
+        v.addWidget(checkbox)
+        if hint:
+            hint_label = QtWidgets.QLabel(hint, row)
+            hint_label.setProperty("class", "setting-hint")
+            hint_label.setWordWrap(True)
+            hint_label.setContentsMargins(26, 0, 0, 0)
+            v.addWidget(hint_label)
+        return row
+
     def _build_settings_page(self) -> QtWidgets.QWidget:
-        scroll_area = QtWidgets.QScrollArea()
+        page = QtWidgets.QWidget()
+        page_layout = QtWidgets.QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        scroll_area = QtWidgets.QScrollArea(page)
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
@@ -1071,10 +1250,11 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         layout.setSpacing(16)
 
         # Title
-        title = QtWidgets.QLabel("Application Configuration", container)
+        title = QtWidgets.QLabel("Configuration", container)
         title.setProperty("class", "page-title")
-        subtitle = QtWidgets.QLabel("Configure AI LLM engines, Whisper audio transcription, and video hardware encoders.", container)
+        subtitle = QtWidgets.QLabel("AI engine, transcription, speaker detection, export and folders. Changes apply after you press Save.", container)
         subtitle.setProperty("class", "page-subtitle")
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
@@ -1197,175 +1377,204 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         self.provider_tab_group.idClicked.connect(lambda idx: self.provider_stack.setCurrentIndex(idx))
 
         layout.addWidget(ai_card)
+        settings_cfg = self.config.get("settings", {})
 
-        # 2. Local Whisper & Audio Intelligence Card
-        whisper_card = QtWidgets.QFrame(container)
-        whisper_card.setProperty("class", "card")
-        whisper_layout = QtWidgets.QGridLayout(whisper_card)
-        whisper_layout.setContentsMargins(18, 16, 18, 16)
-        whisper_layout.setSpacing(12)
+        # 2. Transcription
+        whisper_card, wl = self._settings_card(container, "Transcription", "Speech recognition runs locally on your GPU (WhisperX). Models are downloaded once into data/models.")
 
-        whisper_title = QtWidgets.QLabel("Local Whisper & Audio Intelligence", whisper_card)
-        whisper_title.setProperty("class", "card-title")
-        whisper_layout.addWidget(whisper_title, 0, 0, 1, 2)
-
-        # Whisper Model
-        w_model_label = QtWidgets.QLabel("Whisper Transcribe Model:", whisper_card)
-        w_model_label.setProperty("class", "field-label")
         self.whisper_model_combo = QtWidgets.QComboBox(whisper_card)
         saved_whisper_model = self.config.get("openai", {}).get("whisper_model", "medium")
         self.whisper_model_combo.addItems(editor.get_whisper_models(saved_whisper_model))
         self.whisper_model_combo.setCurrentText(saved_whisper_model)
-
-        whisper_layout.addWidget(w_model_label, 1, 0)
-        whisper_layout.addWidget(self.whisper_model_combo, 1, 1)
-
-        self.whisper_model_status = QtWidgets.QLabel("", whisper_card)
-        self.whisper_model_status.setProperty("class", "page-subtitle")
+        row, self.whisper_model_status = self._setting_row(whisper_card, "Whisper model", "", self.whisper_model_combo)
         self.whisper_model_combo.currentTextChanged.connect(self._update_whisper_model_status)
         self._update_whisper_model_status(self.whisper_model_combo.currentText())
-        whisper_layout.addWidget(self.whisper_model_status, 2, 1)
+        wl.addWidget(self._divider(whisper_card))
+        wl.addWidget(row)
 
-        # Audio Language
-        w_lang_label = QtWidgets.QLabel("Spoken Language:", whisper_card)
-        w_lang_label.setProperty("class", "field-label")
         self.whisper_lang_combo = QtWidgets.QComboBox(whisper_card)
         self.whisper_lang_combo.addItems([
             "Auto-Detect", "English", "Russian", "Spanish", "French", "German", "Italian",
             "Portuguese", "Japanese", "Korean", "Chinese", "Ukrainian", "Polish", "Turkish"
         ])
         self.whisper_lang_combo.setCurrentText(self.config.get("openai", {}).get("whisper_language", "Auto-Detect"))
+        row, _ = self._setting_row(whisper_card, "Spoken language", "Pick it explicitly when you know it: auto-detection only listens to the first 30 seconds.", self.whisper_lang_combo)
+        wl.addWidget(self._divider(whisper_card))
+        wl.addWidget(row)
 
-        whisper_layout.addWidget(w_lang_label, 3, 0)
-        whisper_layout.addWidget(self.whisper_lang_combo, 3, 1)
-
-        # Speaker diarization is always on; it needs a HuggingFace token (model terms accepted) to download pyannote
-        hf_label = QtWidgets.QLabel("HuggingFace Token (speaker labels):", whisper_card)
-        hf_label.setProperty("class", "field-label")
-        self.hf_token_edit = QtWidgets.QLineEdit(whisper_card)
-        self.hf_token_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.hf_token_edit.setPlaceholderText("hf_... (or the HF_TOKEN env variable / data/.hf_token)")
-        self.hf_token_edit.setText(self.config.get("huggingface", {}).get("token", ""))
-        self.hf_token_edit.setToolTip("Speaker diarization is always on. Accept the terms of pyannote/speaker-diarization-community-1 on huggingface.co, "
-                                      "then paste a read token here. Without a token transcripts are made without speaker labels.")
-        whisper_layout.addWidget(hf_label, 4, 0)
-        whisper_layout.addWidget(self.hf_token_edit, 4, 1)
-
-        # Audio Switches
-        self.downmix_checkbox = QtWidgets.QCheckBox("Downmix Multi-Track OBS Audio (amix filter)", whisper_card)
-        self.downmix_checkbox.setChecked(self.config.get("settings", {}).get("audio_downmix", True))
-        whisper_layout.addWidget(self.downmix_checkbox, 5, 0)
-
-        self.peak_checkbox = QtWidgets.QCheckBox("Audio Peak & Screaming Loudness Mapping", whisper_card)
-        self.peak_checkbox.setChecked(self.config.get("settings", {}).get("audio_peak_detection", True))
-        whisper_layout.addWidget(self.peak_checkbox, 5, 1)
-
-        self.combat_checkbox = QtWidgets.QCheckBox("Gunfight & Combat Transient Spikes Detection", whisper_card)
-        self.combat_checkbox.setChecked(self.config.get("settings", {}).get("combat_detection", True))
-        whisper_layout.addWidget(self.combat_checkbox, 6, 0, 1, 2)
-
-        self.cache_checkbox = QtWidgets.QCheckBox("Use transcript cache (reuse a finished transcription of the same video; off = always transcribe from scratch)", whisper_card)
-        self.cache_checkbox.setChecked(self.config.get("settings", {}).get("use_transcript_cache", True))
-        whisper_layout.addWidget(self.cache_checkbox, 7, 0, 1, 2)
-
-        clips_label = QtWidgets.QLabel("Target clips per hour of video (0 = no limit):", whisper_card)
-        clips_label.setProperty("class", "field-label")
-        self.clips_per_hour_spin = QtWidgets.QSpinBox(whisper_card)
-        self.clips_per_hour_spin.setRange(0, 60)
-        self.clips_per_hour_spin.setValue(int(self.config.get("settings", {}).get("clips_per_hour", 12)))
-        whisper_layout.addWidget(clips_label, 8, 0)
-        whisper_layout.addWidget(self.clips_per_hour_spin, 8, 1)
-
+        self.cache_checkbox = QtWidgets.QCheckBox("Reuse finished transcripts (cache)", whisper_card)
+        self.cache_checkbox.setChecked(settings_cfg.get("use_transcript_cache", True))
+        wl.addWidget(self._divider(whisper_card))
+        wl.addWidget(self._toggle_row(whisper_card, self.cache_checkbox, "Re-cutting the same video with another prompt takes seconds. Turn off to always transcribe from scratch (nothing is read or saved)."))
         layout.addWidget(whisper_card)
 
-        # 3. Video Export & Hardware Acceleration Card
-        proc_card = QtWidgets.QFrame(container)
-        proc_card.setProperty("class", "card")
-        proc_layout = QtWidgets.QGridLayout(proc_card)
-        proc_layout.setContentsMargins(18, 16, 18, 16)
-        proc_layout.setSpacing(12)
+        # 3. Speaker detection (opt-in, needs a HuggingFace token)
+        spk_card, sl = self._settings_card(container, "Speaker detection", "Labels who is talking (SPEAKER_00, SPEAKER_01, ...) so the AI keeps questions with answers and jokes with reactions.")
+        self.diarization_checkbox = QtWidgets.QCheckBox("Detect speakers", spk_card)
+        self.diarization_checkbox.setChecked(bool(settings_cfg.get("speaker_diarization", False)))
+        sl.addWidget(self._divider(spk_card))
+        sl.addWidget(self._toggle_row(spk_card, self.diarization_checkbox, "Off by default. Needs a free HuggingFace token and extra time and memory on long streams."))
 
-        proc_title = QtWidgets.QLabel("Video Export & Hardware Acceleration", proc_card)
-        proc_title.setProperty("class", "card-title")
-        proc_layout.addWidget(proc_title, 0, 0, 1, 2)
+        token_box = QtWidgets.QWidget(spk_card)
+        token_layout = QtWidgets.QHBoxLayout(token_box)
+        token_layout.setContentsMargins(0, 0, 0, 0)
+        token_layout.setSpacing(8)
+        self.hf_token_edit = QtWidgets.QLineEdit(token_box)
+        self.hf_token_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.hf_token_edit.setPlaceholderText("hf_...")
+        self.hf_token_edit.setText(self.config.get("huggingface", {}).get("token", ""))
+        token_layout.addWidget(self.hf_token_edit, 1)
+        self.hf_token_help_btn = QtWidgets.QPushButton("Get a token", token_box)
+        self.hf_token_help_btn.setProperty("class", "secondary-btn")
+        self.hf_token_help_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.hf_token_help_btn.setToolTip("Opens huggingface.co/settings/tokens. Also accept the terms on the pyannote/speaker-diarization-community-1 page (see README).")
+        self.hf_token_help_btn.clicked.connect(self._open_hf_token_page)
+        token_layout.addWidget(self.hf_token_help_btn, 0)
+        self.hf_token_row, self.hf_token_hint = self._setting_row(spk_card, "HuggingFace token", "", token_box, control_width=380)
+        sl.addWidget(self._divider(spk_card))
+        sl.addWidget(self.hf_token_row)
+        self.hf_token_error = QtWidgets.QLabel("Required: paste a HuggingFace token, or switch speaker detection off.", spk_card)
+        self.hf_token_error.setProperty("class", "error-text")
+        self.hf_token_error.setWordWrap(True)
+        sl.addWidget(self.hf_token_error)
+        self.diarization_checkbox.toggled.connect(self._update_diarization_ui)
+        self.hf_token_edit.textChanged.connect(self._update_diarization_ui)
+        self._update_diarization_ui()
+        layout.addWidget(spk_card)
 
-        self.hw_encode_checkbox = QtWidgets.QCheckBox("GPU Hardware Acceleration (NVENC / AMF)", proc_card)
-        self.hw_encode_checkbox.setChecked(self.config.get("settings", {}).get("hardware_encoding", False))
-        proc_layout.addWidget(self.hw_encode_checkbox, 1, 0)
+        # 4. Audio analysis
+        audio_card, al = self._settings_card(container, "Audio analysis", "What the AI is told about the sound, besides the words.")
+        self.downmix_checkbox = QtWidgets.QCheckBox("Merge all audio tracks", audio_card)
+        self.downmix_checkbox.setChecked(settings_cfg.get("audio_downmix", True))
+        al.addWidget(self._divider(audio_card))
+        al.addWidget(self._toggle_row(audio_card, self.downmix_checkbox, "OBS recordings often keep the mic, Discord and the game on separate tracks: mix them so no speech is lost."))
+        self.peak_checkbox = QtWidgets.QCheckBox("Loudness, laughter and screams", audio_card)
+        self.peak_checkbox.setChecked(settings_cfg.get("audio_peak_detection", True))
+        al.addWidget(self._divider(audio_card))
+        al.addWidget(self._toggle_row(audio_card, self.peak_checkbox, "Marks loud lines and detects laughter and screams in the raw audio (sound classifier on the GPU)."))
+        self.combat_checkbox = QtWidgets.QCheckBox("Gunfights and impacts", audio_card)
+        self.combat_checkbox.setChecked(settings_cfg.get("combat_detection", True))
+        al.addWidget(self._divider(audio_card))
+        al.addWidget(self._toggle_row(audio_card, self.combat_checkbox, "Flags sharp transients such as gunshots and explosions."))
+        layout.addWidget(audio_card)
 
-        self.vr_checkbox = QtWidgets.QCheckBox("Apply VR Anti-Shake Deshake Filter", proc_card)
-        self.vr_checkbox.setChecked(self.config.get("settings", {}).get("vr_stabilization", False))
-        proc_layout.addWidget(self.vr_checkbox, 1, 1)
+        # 5. Clip selection
+        sel_card, cl = self._settings_card(container, "Clip selection")
+        self.clips_per_hour_spin = QtWidgets.QSpinBox(sel_card)
+        self.clips_per_hour_spin.setRange(0, 60)
+        self.clips_per_hour_spin.setValue(int(settings_cfg.get("clips_per_hour", 12)))
+        self.clips_per_hour_spin.setSpecialValueText("No limit")
+        self.clips_per_hour_spin.setSuffix(" per hour")
+        self.clips_per_hour_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        row, _ = self._setting_row(sel_card, "Clips per hour of video", "More clips means a lower score bar. 0 removes the limit.", self.clips_per_hour_spin, control_width=170)
+        cl.addWidget(self._divider(sel_card))
+        cl.addWidget(row)
+        layout.addWidget(sel_card)
 
-        self.vertical_checkbox = QtWidgets.QCheckBox("Generate Vertical 9:16 Shorts", proc_card)
-        self.vertical_checkbox.setChecked(self.config.get("settings", {}).get("vertical_export", False))
-        proc_layout.addWidget(self.vertical_checkbox, 2, 0)
-
+        # 6. Video export
+        proc_card, pl = self._settings_card(container, "Video export")
+        self.hw_encode_checkbox = QtWidgets.QCheckBox("GPU hardware encoding", proc_card)
+        self.hw_encode_checkbox.setChecked(settings_cfg.get("hardware_encoding", False))
+        pl.addWidget(self._divider(proc_card))
+        pl.addWidget(self._toggle_row(proc_card, self.hw_encode_checkbox, "Cuts clips with NVENC / AMF: much faster than the CPU."))
+        self.vr_checkbox = QtWidgets.QCheckBox("VR anti-shake filter", proc_card)
+        self.vr_checkbox.setChecked(settings_cfg.get("vr_stabilization", False))
+        pl.addWidget(self._divider(proc_card))
+        pl.addWidget(self._toggle_row(proc_card, self.vr_checkbox, "Applies a deshake filter, for VR gameplay."))
+        self.vertical_checkbox = QtWidgets.QCheckBox("Also make vertical 9:16 versions", proc_card)
+        self.vertical_checkbox.setChecked(settings_cfg.get("vertical_export", False))
+        pl.addWidget(self._divider(proc_card))
+        pl.addWidget(self._toggle_row(proc_card, self.vertical_checkbox, "For Shorts, Reels and TikTok."))
         self.vertical_mode_combo = QtWidgets.QComboBox(proc_card)
         self.vertical_mode_combo.addItems([
             "Standard Center Crop", "Left-Third (Facecam)", "Right-Third",
             "Blurred Background (Portrait)", "Custom Coordinates"
         ])
-        self.vertical_mode_combo.setCurrentText(self.config.get("settings", {}).get("vertical_mode", "Standard Center Crop"))
-        proc_layout.addWidget(self.vertical_mode_combo, 2, 1)
-
+        self.vertical_mode_combo.setCurrentText(settings_cfg.get("vertical_mode", "Standard Center Crop"))
+        row, _ = self._setting_row(proc_card, "Vertical framing", "", self.vertical_mode_combo)
+        pl.addWidget(self._divider(proc_card))
+        pl.addWidget(row)
+        self.vertical_checkbox.toggled.connect(self.vertical_mode_combo.setEnabled)
+        self.vertical_mode_combo.setEnabled(self.vertical_checkbox.isChecked())
         layout.addWidget(proc_card)
 
-        # 4. Storage & Integrations Card
-        storage_card = QtWidgets.QFrame(container)
-        storage_card.setProperty("class", "card")
-        storage_layout = QtWidgets.QGridLayout(storage_card)
-        storage_layout.setContentsMargins(18, 16, 18, 16)
-        storage_layout.setSpacing(12)
-
-        storage_title = QtWidgets.QLabel("Storage & Discord Notifications", storage_card)
-        storage_title.setProperty("class", "card-title")
-        storage_layout.addWidget(storage_title, 0, 0, 1, 3)
-
-        clips_dir_label = QtWidgets.QLabel("Generated Clips Folder:", storage_card)
-        clips_dir_label.setProperty("class", "field-label")
-        self.clips_dir_edit = QtWidgets.QLineEdit(storage_card)
-        self.clips_dir_edit.setText(self.config.get("settings", {}).get("clips_dir", ""))
+        # 7. Folders & notifications
+        storage_card, tl = self._settings_card(container, "Folders and notifications")
+        folder_box = QtWidgets.QWidget(storage_card)
+        folder_layout = QtWidgets.QHBoxLayout(folder_box)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.setSpacing(8)
+        self.clips_dir_edit = QtWidgets.QLineEdit(folder_box)
+        self.clips_dir_edit.setText(settings_cfg.get("clips_dir", ""))
         self.clips_dir_edit.setPlaceholderText("C:\\Videos\\Clips")
-        browse_clips_btn = QtWidgets.QPushButton("Browse...", storage_card)
+        browse_clips_btn = QtWidgets.QPushButton("Browse...", folder_box)
         browse_clips_btn.setProperty("class", "secondary-btn")
         browse_clips_btn.setCursor(QtCore.Qt.PointingHandCursor)
         browse_clips_btn.clicked.connect(self._browse_clips_dir)
+        folder_layout.addWidget(self.clips_dir_edit, 1)
+        folder_layout.addWidget(browse_clips_btn, 0)
+        row, _ = self._setting_row(storage_card, "Clips folder", "Finished clips (video, thumbnail and AI notes) are saved here. Required.", folder_box, control_width=380)
+        tl.addWidget(self._divider(storage_card))
+        tl.addWidget(row)
 
-        storage_layout.addWidget(clips_dir_label, 1, 0)
-        storage_layout.addWidget(self.clips_dir_edit, 1, 1)
-        storage_layout.addWidget(browse_clips_btn, 1, 2)
-
-        discord_label = QtWidgets.QLabel("Discord Webhook URL:", storage_card)
-        discord_label.setProperty("class", "field-label")
-        self.discord_edit = QtWidgets.QLineEdit(storage_card)
+        discord_box = QtWidgets.QWidget(storage_card)
+        discord_layout = QtWidgets.QHBoxLayout(discord_box)
+        discord_layout.setContentsMargins(0, 0, 0, 0)
+        discord_layout.setSpacing(8)
+        self.discord_edit = QtWidgets.QLineEdit(discord_box)
         self.discord_edit.setText(self.config.get("integrations", {}).get("discord_webhook", ""))
         self.discord_edit.setPlaceholderText("https://discord.com/api/webhooks/...")
-        test_discord_btn = QtWidgets.QPushButton("Test Alert", storage_card)
+        test_discord_btn = QtWidgets.QPushButton("Test", discord_box)
         test_discord_btn.setProperty("class", "secondary-btn")
         test_discord_btn.setCursor(QtCore.Qt.PointingHandCursor)
         test_discord_btn.clicked.connect(self._test_discord_webhook)
-
-        storage_layout.addWidget(discord_label, 2, 0)
-        storage_layout.addWidget(self.discord_edit, 2, 1)
-        storage_layout.addWidget(test_discord_btn, 2, 2)
-
+        discord_layout.addWidget(self.discord_edit, 1)
+        discord_layout.addWidget(test_discord_btn, 0)
+        row, _ = self._setting_row(storage_card, "Discord webhook", "Optional: a message is sent when a queue finishes.", discord_box, control_width=380)
+        tl.addWidget(self._divider(storage_card))
+        tl.addWidget(row)
         layout.addWidget(storage_card)
+        layout.addStretch()
 
-        # Save Button
-        save_layout = QtWidgets.QHBoxLayout()
-        save_layout.addStretch()
-        self.save_settings_btn = QtWidgets.QPushButton("💾 Save Configuration", container)
+        scroll_area.setWidget(container)
+        page_layout.addWidget(scroll_area, 1)
+
+        # Save bar: always visible, not part of the scrolled content
+        footer = QtWidgets.QFrame(page)
+        footer.setProperty("class", "footer-bar")
+        footer_layout = QtWidgets.QHBoxLayout(footer)
+        footer_layout.setContentsMargins(28, 12, 28, 12)
+        footer_hint = QtWidgets.QLabel("Settings are stored in config.json next to the program.", footer)
+        footer_hint.setProperty("class", "setting-hint")
+        footer_layout.addWidget(footer_hint, 1)
+        self.save_settings_btn = QtWidgets.QPushButton("Save settings", footer)
         self.save_settings_btn.setProperty("class", "primary-btn")
-        self.save_settings_btn.setMinimumHeight(42)
-        self.save_settings_btn.setFixedWidth(180)
+        self.save_settings_btn.setMinimumHeight(40)
+        self.save_settings_btn.setMinimumWidth(170)
         self.save_settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.save_settings_btn.clicked.connect(self._save_settings)
-        save_layout.addWidget(self.save_settings_btn)
+        footer_layout.addWidget(self.save_settings_btn, 0)
+        page_layout.addWidget(footer, 0)
+        return page
 
-        layout.addLayout(save_layout)
-        scroll_area.setWidget(container)
-        return scroll_area
+    def _speaker_token_missing(self, config: dict, token_text: Optional[str] = None) -> bool:
+        """True when speaker detection is on but no HuggingFace token can be found (field, HF_TOKEN env, data/.hf_token)."""
+        if token_text is not None:
+            config = dict(config, huggingface={"token": token_text})
+        return bool(config.get("settings", {}).get("speaker_diarization", False)) and not whisper_backend.resolve_hf_token(config)
+
+    def _update_diarization_ui(self, *_args):
+        """The token field is only editable while speaker detection is on; an empty token is flagged right there."""
+        on = self.diarization_checkbox.isChecked()
+        self.hf_token_row.setEnabled(on)
+        self.hf_token_hint.setText("Create a free token on huggingface.co and accept the pyannote model terms: see the README, section Speaker detection."
+                                   if on else "Locked while speaker detection is off.")
+        self.hf_token_hint.setVisible(True)
+        missing = on and not self.hf_token_edit.text().strip() and not whisper_backend.resolve_hf_token({})
+        self.hf_token_error.setVisible(bool(missing))
+
+    def _open_hf_token_page(self):
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://huggingface.co/settings/tokens"))
 
     def _create_provider_panel(self, title: str, prov_id: str, active_prov: str, api_key: str, models: List[str], current_model: str, base_url: str, test_func, is_openai: bool = False):
         panel = QtWidgets.QWidget()
@@ -1733,6 +1942,16 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             self.clips_dir_edit.setText(folder)
 
     def _save_settings(self):
+        if self.diarization_checkbox.isChecked() and self._speaker_token_missing(
+                {"settings": {"speaker_diarization": True}}, self.hf_token_edit.text().strip()):
+            self._update_diarization_ui()
+            self.hf_token_edit.setFocus()
+            QtWidgets.QMessageBox.warning(
+                self, "HuggingFace token required",
+                "Speaker detection needs a HuggingFace token.\n\nPaste a token into the field (see the README, section "
+                "\"Speaker detection\", for how to get one) or switch speaker detection off.")
+            return
+
         active_btn = self.provider_btn_group.checkedButton()
         if active_btn:
             self.config["active_ai_provider"] = active_btn.property("prov_id")
@@ -1763,6 +1982,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         settings["audio_peak_detection"] = self.peak_checkbox.isChecked()
         settings["combat_detection"] = self.combat_checkbox.isChecked()
         settings["use_transcript_cache"] = self.cache_checkbox.isChecked()
+        settings["speaker_diarization"] = self.diarization_checkbox.isChecked()
         settings["clips_per_hour"] = self.clips_per_hour_spin.value()
         settings["deepseek_thinking"] = self.deepseek_thinking_checkbox.isChecked()
         settings["hardware_encoding"] = self.hw_encode_checkbox.isChecked()
@@ -1781,6 +2001,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
         """Shows whether the selected Whisper model is already in data/models/whisper or will be downloaded on first use."""
         if not hasattr(self, "whisper_model_status"):
             return
+        self.whisper_model_status.setVisible(True)
         if model_name not in whisper_backend.available_models():
             self.whisper_model_status.setText("custom model (local path or repo id): loaded as given")
         elif whisper_backend.is_model_downloaded(model_name):

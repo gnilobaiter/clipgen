@@ -54,6 +54,8 @@ def test_pyside_app_initialization(temp_config_env):
     assert {"large-v3", "large-v3-turbo", "distil-large-v3", "tiny.en"} <= set(models)  # every faster-whisper model is offered
     assert window.cache_checkbox.isChecked()  # the transcript cache is on by default
     assert window.hf_token_edit.text() == ""
+    assert not window.diarization_checkbox.isChecked()  # speaker detection is opt-in
+    assert not window.hf_token_row.isEnabled() and window.hf_token_error.isHidden()  # the token field is locked while it is off
     window.close()
 
 
@@ -304,4 +306,71 @@ def test_console_shows_structure_colours_and_never_interprets_log_text_as_html(t
     assert "<b>bold</b> & co" in text  # shown literally, not rendered as bold
     html = window.console_text.document().toHtml()
     assert "#a78bfa" in html and "#34d399" in html and "#64748b" in html  # AI violet, success green, dim grey
+    window.close()
+
+
+@pytest.fixture
+def no_token(monkeypatch):
+    """No HuggingFace token anywhere (field, HF_TOKEN, data/.hf_token)."""
+    monkeypatch.setattr("src.core.transcriber.resolve_hf_token", lambda cfg=None: str(((cfg or {}).get("huggingface") or {}).get("token", "")).strip() or None)
+
+
+@pytest.mark.usefixtures("qapp", "no_token")
+def test_speaker_toggle_unlocks_the_token_field_and_flags_an_empty_token(temp_config_env):
+    window = ClipGenPySideApp()
+    assert not window.hf_token_row.isEnabled()
+    window.diarization_checkbox.setChecked(True)
+    assert window.hf_token_row.isEnabled()
+    assert not window.hf_token_error.isHidden()  # an empty token is flagged right under the field
+    window.hf_token_edit.setText("hf_abc")
+    assert window.hf_token_error.isHidden()
+    window.diarization_checkbox.setChecked(False)
+    assert not window.hf_token_row.isEnabled() and window.hf_token_error.isHidden()
+    window.close()
+
+
+@pytest.mark.usefixtures("qapp", "no_token")
+def test_saving_with_speakers_on_needs_a_token(temp_config_env, monkeypatch):
+    cfg_file, _ = temp_config_env
+    window = ClipGenPySideApp()
+    warnings = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda _w, title, msg: warnings.append(title))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: None)
+
+    window.diarization_checkbox.setChecked(True)
+    window._save_settings()
+    assert warnings == ["HuggingFace token required"]
+    assert config_manager.load_config(cfg_file)["settings"]["speaker_diarization"] is False  # nothing was saved
+
+    window.hf_token_edit.setText("hf_good")
+    window._save_settings()
+    saved = config_manager.load_config(cfg_file)
+    assert saved["settings"]["speaker_diarization"] is True and saved["huggingface"]["token"] == "hf_good"
+    window.close()
+
+
+@pytest.mark.usefixtures("qapp", "no_token")
+def test_processing_does_not_start_with_speakers_on_and_no_token(temp_config_env, monkeypatch):
+    window = ClipGenPySideApp()
+    warnings = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda _w, title, msg: warnings.append(title))
+    window.config.setdefault("settings", {})["speaker_diarization"] = True
+    window.config.setdefault("huggingface", {})["token"] = ""
+    window.video_input.setText("video.mp4")
+    window._start_extraction()
+    assert warnings == ["HuggingFace token required"]
+    assert window.worker is None or not window.worker.isRunning()
+    assert window.start_extract_btn.isEnabled()  # nothing started
+    window.close()
+
+
+@pytest.mark.usefixtures("qapp")
+def test_checkboxes_draw_a_real_check_mark(temp_config_env):
+    import os
+    window = ClipGenPySideApp()
+    sheet = window.styleSheet()
+    assert "__CHECK_ICON__" not in sheet and "__DOT_ICON__" not in sheet
+    icons = [part.split(")")[0] for part in sheet.split("url(")[1:]]
+    assert len(icons) == 2 and all(os.path.isfile(path) for path in icons)  # the check mark and the radio dot are bundled and found
+    assert any(path.endswith("check.svg") for path in icons)
     window.close()

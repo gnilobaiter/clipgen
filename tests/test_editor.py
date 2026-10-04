@@ -718,7 +718,8 @@ def test_transcribe_adds_events_words_and_loudness(tmp_path, monkeypatch):
 
     video = tmp_path / "video.mp4"
     video.write_text("dummy")
-    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"}, "settings": {"audio_peak_detection": True, "combat_detection": False}}
+    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"},
+              "settings": {"audio_peak_detection": True, "combat_detection": False, "speaker_diarization": True}}
     result = editor._transcribe_audio_to_segments(str(video), config, logger=None, is_cancelled=None)
 
     assert engine.calls == [{"language": None, "hf_token": "hf_x"}]
@@ -994,7 +995,8 @@ def test_transcript_is_cached_as_a_document_with_speakers(tmp_path, monkeypatch)
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
     video = tmp_path / "video.mp4"
     video.write_text("dummy")
-    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"}, "settings": {"audio_peak_detection": False, "combat_detection": False}}
+    config = {"openai": {"whisper_model": "base", "whisper_language": "Auto-Detect"},
+              "settings": {"audio_peak_detection": False, "combat_detection": False, "speaker_diarization": True}}
 
     first = editor._transcribe_audio_to_segments(str(video), config, None, None)
     assert [s["speaker"] for s in first] == ["SPEAKER_00", "SPEAKER_01"]
@@ -1007,12 +1009,63 @@ def test_transcript_is_cached_as_a_document_with_speakers(tmp_path, monkeypatch)
     assert len(engine.calls) == 1  # second run came from the cache
 
 
+def test_speaker_detection_is_off_by_default_and_ignores_an_available_token(tmp_path, monkeypatch):
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "a"}], token="hf_available")
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {"audio_peak_detection": False, "combat_detection": False}}
+    logs = []
+    assert editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
+    assert engine.calls == [{"language": "en", "hf_token": None}]  # no token is handed to the diarizer
+    assert any("speakers: off" in line for line in logs) and not any("token" in line.lower() for line in logs)
+    # and it is cached normally (a speaker-less transcript is exactly what was asked for)
+    editor._transcribe_audio_to_segments(str(video), config, None, None)
+    assert len(engine.calls) == 1
+
+
+def test_speaker_detection_on_without_a_token_refuses_to_run(tmp_path, monkeypatch):
+    engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "a"}], token=None)
+    monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
+    video = tmp_path / "video.mp4"
+    video.write_text("dummy")
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {"speaker_diarization": True}}
+    logs = []
+    assert editor._transcribe_audio_to_segments(str(video), config, logs.append, None) is None
+    assert engine.calls == [] and any("no HuggingFace token" in line for line in logs)
+
+
+def test_process_video_stops_before_any_work_when_speaker_token_is_missing(tmp_path, monkeypatch):
+    video = tmp_path / "gameplay.mp4"
+    video.write_text("dummy")
+    fake_config = {"active_ai_provider": "openai", "openai_model": "gpt-4o", "settings": {"clips_dir": str(tmp_path / "clips"), "speaker_diarization": True},
+                   "prompts": {"profiles": {"Default": "P"}}}
+    monkeypatch.setattr("src.core.editor.config_manager.load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr("src.core.editor._validate_api_keys", lambda *a, **k: True)
+    monkeypatch.setattr("src.core.editor.resolve_hf_token", lambda cfg=None: None)
+    transcribe = MagicMock()
+    monkeypatch.setattr("src.core.editor._transcribe_audio_to_segments", transcribe)
+    logs = []
+    assert editor.process_video(str(video), logger=logs.append) is False
+    transcribe.assert_not_called()  # no model is loaded, no GPU time is spent
+    assert any(editor.SPEAKER_TOKEN_MESSAGE in line for line in logs)
+
+
+def test_validate_speaker_token(monkeypatch):
+    monkeypatch.setattr("src.core.editor.resolve_hf_token", lambda cfg=None: None)
+    assert editor._validate_speaker_token({"settings": {}}, None) is True  # off: nothing needed
+    assert editor._validate_speaker_token({"settings": {"speaker_diarization": True}}, None) is False
+    monkeypatch.setattr("src.core.editor.resolve_hf_token", lambda cfg=None: "hf_x")
+    assert editor._validate_speaker_token({"settings": {"speaker_diarization": True}}, None) is True
+
+
 def test_transcript_without_speakers_is_not_cached_when_a_token_was_set(tmp_path, monkeypatch):
     engine = _use_engine(monkeypatch, tmp_path, segments=[{"start": 0.0, "end": 5.0, "text": "a"}], diarized=False, token="hf_bad")
     monkeypatch.setattr("src.core.editor.extract_audio_hidden", lambda f: np.zeros(16000, dtype=np.float32))
     video = tmp_path / "video.mp4"
     video.write_text("dummy")
-    config = {"openai": {"whisper_model": "base", "whisper_language": "English"}, "settings": {"audio_peak_detection": False, "combat_detection": False}}
+    config = {"openai": {"whisper_model": "base", "whisper_language": "English"},
+              "settings": {"audio_peak_detection": False, "combat_detection": False, "speaker_diarization": True}}
     logs = []
     assert editor._transcribe_audio_to_segments(str(video), config, logs.append, None)
     assert any("Not cached" in line for line in logs)

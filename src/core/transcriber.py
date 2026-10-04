@@ -4,6 +4,7 @@ Every model (Whisper, alignment, diarization) is stored under <project root>/mod
 lazily so that importing this module (and the rest of the app) stays cheap and testable without the GPU stack.
 """
 
+import bisect
 import gc
 import logging
 import os
@@ -117,6 +118,61 @@ class _Progress:
         if self.logger and percent >= self._next_log:
             self.logger(f"⏳ {self.label}: {int(percent)}%")
             self._next_log = (int(percent) // 25 + 1) * 25
+
+
+MAX_WORD_SECONDS = 2.0  # even a drawn-out word is not longer than this
+BASE_WORD_SECONDS = 0.25
+SECONDS_PER_LETTER = 0.1
+
+
+def _word_cap(word: str) -> float:
+    """The longest a spoken word of this length plausibly lasts (a 6-letter word ~ 0.85 s, never more than MAX_WORD_SECONDS)."""
+    letters = sum(ch.isalnum() for ch in word)
+    return min(MAX_WORD_SECONDS, BASE_WORD_SECONDS + SECONDS_PER_LETTER * letters)
+
+
+SPEECH_END_PAD = 0.25  # a word may end this long after the VAD's speech region ends (the VAD cuts at a probability threshold)
+SPEECH_START_SLACK = 0.3  # a word that starts this close before a speech region still belongs to it
+
+
+def _region_end_for(start: float, regions: List[Tuple[float, float]], starts: List[float]) -> Optional[float]:
+    """End of the VAD speech region the word (starting at `start`) belongs to, None when it starts in silence."""
+    i = bisect.bisect_right(starts, start + SPEECH_START_SLACK) - 1
+    if i < 0:
+        return None
+    region_start, region_end = regions[i]
+    return region_end if start < region_end + SPEECH_END_PAD else None
+
+
+def tighten_word_timings(segments: List[Dict[str, Any]], speech: Optional[List[Tuple[float, float]]] = None) -> List[Dict[str, Any]]:
+    """WhisperX's forced alignment stretches the LAST word of a line over the silence (or non-speech) that follows it:
+    in a real stream 1 line in 3 ended with a "word" lasting 1.5 s - 25 s (a normal word lasts 0.2 s), so every line looked
+    like it ran on for seconds, pauses vanished and clips were cut long after the joke was over. Each word is limited to
+    what it can plausibly last and, when the VAD's speech regions are known (`speech`: sorted (start, end) seconds), to the
+    end of the region it was spoken in. A line ends where its last word really ends. Lines without word timings are kept."""
+    regions = sorted(speech) if speech else []
+    starts = [r[0] for r in regions]
+    out: List[Dict[str, Any]] = []
+    for seg in segments:
+        words = seg.get("words")
+        if not words:
+            out.append(seg)
+            continue
+        tight = []
+        for w in words:
+            if "start" in w and "end" in w:
+                end = min(float(w["end"]), float(w["start"]) + _word_cap(str(w.get("word", ""))))
+                region_end = _region_end_for(float(w["start"]), regions, starts) if regions else None
+                if region_end is not None:
+                    end = min(end, max(float(w["start"]), region_end + SPEECH_END_PAD))
+                w = dict(w, end=round(end, 3))
+            tight.append(w)
+        timed = [w for w in tight if "start" in w and "end" in w]
+        entry = dict(seg, words=tight)
+        if timed:
+            entry["end"] = round(max(float(seg["start"]), min(float(seg["end"]), max(float(w["end"]) for w in timed))), 3)
+        out.append(entry)
+    return out
 
 
 def split_by_speaker(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -241,10 +297,23 @@ class Transcriber:
         turns = self._diarizer(audio, progress_callback=_Progress(self.logger, is_cancelled, "Speaker diarization"))
         return self._whisperx.assign_word_speakers(turns, {"segments": segments})["segments"]
 
+    def _speech_regions(self, audio: np.ndarray) -> Optional[List[Tuple[float, float]]]:
+        """Where the WhisperX VAD (pyannote) hears speech, as (start, end) seconds; None when that cannot be asked."""
+        try:
+            from whisperx.vads.pyannote import Binarize, Pyannote
+            params = getattr(self._model, "_vad_params", None) or {}
+            scores = self._model.vad_model({"waveform": Pyannote.preprocess_audio(audio), "sample_rate": 16000})
+            active = Binarize(onset=params.get("vad_onset", 0.5), offset=params.get("vad_offset", 0.363))(scores)
+            return [(float(s.start), float(s.end)) for s in active.get_timeline().support()]
+        except Exception as e:
+            if self.logger: self.logger(f"ℹ️ Speech regions unavailable ({e}); word ends are limited by word length only.")
+            return None
+
     def transcribe(self, audio: np.ndarray, language: Optional[str], hf_token: Optional[str] = None,
                    is_cancelled: Optional[Callable[[], bool]] = None) -> TranscriptionOutput:
-        """Speech recognition -> word alignment -> speaker diarization. Alignment and diarization failures degrade the
-        result (no words / no speakers) instead of failing the whole transcription; cancellation always propagates."""
+        """Speech recognition -> word alignment -> speaker diarization (only when a `hf_token` is given: speaker detection
+        is opt-in in Settings). Alignment and diarization failures degrade the result (no words / no speakers) instead of
+        failing the whole transcription; cancellation always propagates."""
         result = self._model.transcribe(audio, batch_size=pick_batch_size(), language=language,
                                         progress_callback=_Progress(self.logger, is_cancelled, "Transcribing"))
         detected = result.get("language") or language
@@ -256,8 +325,10 @@ class Transcriber:
         align = self._align_model(detected) if detected and self._align_ready else None
         if align is not None:
             try:
-                segments = self._whisperx.align(segments, *align, audio, self.device, return_char_alignments=False,
-                                                progress_callback=_Progress(self.logger, is_cancelled, "Aligning words"))["segments"]
+                aligned = self._whisperx.align(
+                    segments, *align, audio, self.device, return_char_alignments=False,
+                    progress_callback=_Progress(self.logger, is_cancelled, "Aligning words"))["segments"]
+                segments = tighten_word_timings(aligned, self._speech_regions(audio))
             except TranscriptionCancelled:
                 raise
             except Exception as e:
@@ -275,8 +346,6 @@ class Transcriber:
                 self._free_gpu_cache()
                 if self.logger: self.logger(f"⚠️ Speaker diarization unavailable ({e}); continuing without speakers. "
                                             "Check the HuggingFace token and accept the terms of pyannote/speaker-diarization-community-1.")
-        elif self.logger:
-            self.logger("⚠️ No HuggingFace token set (Settings -> Whisper): continuing without speaker labels.")
         return TranscriptionOutput(detected, segments, diarized, speakers_of(segments), align_failed)
 
     def close(self) -> None:

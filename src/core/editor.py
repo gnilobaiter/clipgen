@@ -363,6 +363,18 @@ def extract_clips(input_file: str, clips_data: Dict[str, Any], output_dir: str, 
 
     return created_files
 
+SPEAKER_TOKEN_MESSAGE = ("❌ Speaker detection is ON but no HuggingFace token is set. Paste a token in Settings -> Speaker detection "
+                         "(or switch speaker detection off). See the README for how to get one.")
+
+
+def _validate_speaker_token(config: Dict[str, Any], logger: Optional[Callable[[str], None]]) -> bool:
+    """Speaker detection (opt-in) needs a HuggingFace token: refuse to start without one instead of silently skipping it."""
+    if config.get("settings", {}).get("speaker_diarization", False) and not resolve_hf_token(config):
+        if logger: logger(SPEAKER_TOKEN_MESSAGE)
+        return False
+    return True
+
+
 def _validate_api_keys(config: Dict[str, Any], chat_model: str, logger: Optional[Callable[[str], None]]) -> bool:
     openai_key = config.get("openai", {}).get("api_key", "").strip()
     openai_base_url = config.get("openai", {}).get("base_url", "").strip()
@@ -490,14 +502,14 @@ def _parse_json_clips(raw_text: Any) -> Optional[List[Dict[str, Any]]]:
         return _clean_and_merge_clips(data)
     return None
 
-# Bump when the cached transcript layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds; v4: YAMNet laughter/scream classifier replaces the modulation heuristic; v5: calibrated combat threshold; v6: WhisperX engine, wav2vec2 word alignment, speaker labels, document layout)
-TRANSCRIPT_CACHE_VERSION = 6
+# Bump when the cached transcript layout or detector calibration changes (v2: word timestamps, local-baseline loudness, audio events; v3: calibrated event thresholds; v4: YAMNet laughter/scream classifier replaces the modulation heuristic; v5: calibrated combat threshold; v6: WhisperX engine, wav2vec2 word alignment, speaker labels, document layout; v7: word / line ends no longer stretched over the following silence)
+TRANSCRIPT_CACHE_VERSION = 7
 TRANSCRIPT_ENGINE = "whisperx"
 
 
 def _get_transcription_cache_path(file_path: str, whisper_model: str, target_language: Optional[str], audio_peak: bool, combat: bool, diarize: bool = False) -> str:
     """Computes a deterministic hash and cache file path for audio transcriptions.
-    `diarize` (a HuggingFace token is available) is part of the key so a transcript cached without speakers is not reused once speakers can be labelled."""
+    `diarize` (speaker detection is switched on) is part of the key so a transcript cached without speakers is not reused once speakers are wanted."""
     try:
         mtime = os.path.getmtime(file_path)
         size = os.path.getsize(file_path)
@@ -633,11 +645,15 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
     audio_peak_detection = settings_cfg.get("audio_peak_detection", True)
     combat_detection = settings_cfg.get("combat_detection", True)
     use_cache = bool(settings_cfg.get("use_transcript_cache", True))
-    hf_token = resolve_hf_token(config)
+    diarize = bool(settings_cfg.get("speaker_diarization", False))
+    hf_token = resolve_hf_token(config) if diarize else None
+    if diarize and not hf_token:
+        if logger: logger(SPEAKER_TOKEN_MESSAGE)
+        return None
 
     cache_file: Optional[str] = None
     if use_cache:
-        cache_file = _get_transcription_cache_path(file_path, whisper_model_type, target_language, audio_peak_detection, combat_detection, diarize=bool(hf_token))
+        cache_file = _get_transcription_cache_path(file_path, whisper_model_type, target_language, audio_peak_detection, combat_detection, diarize=diarize)
         cached_segments = _load_cached_segments(cache_file, logger)
         if cached_segments is not None:
             if logger: logger(f"🔊 Audio events stored in the cache: {_format_event_counts(cached_segments)} (sound classifier not re-run).")
@@ -671,7 +687,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
         lang_desc = target_language if target_language else "Auto-Detect"
         if logger:
             suffix = " and analyzing sound patterns" if (audio_peak_detection or combat_detection) else ""
-            logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}, speakers: {'on' if hf_token else 'no token'}]{suffix}...")
+            logger(f"🎙️ Transcribing audio [Lang: {lang_desc}, Model: {whisper_model_type}, speakers: {'on' if diarize else 'off'}]{suffix}...")
 
         try:
             output = engine.transcribe(audio_array, target_language, hf_token, is_cancelled)
@@ -684,7 +700,7 @@ def _transcribe_audio_to_segments(file_path: str, config: Dict[str, Any], logger
                 logger(("✅ Transcription complete! Audio patterns analyzed." if (audio_peak_detection or combat_detection) else "✅ Transcription complete!") + speaker_note)
 
             if segments and cache_file:
-                if (output.diarized or not hf_token) and not output.align_failed:
+                if (output.diarized or not diarize) and not output.align_failed:
                     _save_cached_segments(cache_file, segments, logger, {
                         "model": whisper_model_type, "language": output.language, "diarized": output.diarized, "speakers": output.speakers})
                 elif logger:
@@ -1214,6 +1230,9 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
         return False
 
     if not _validate_api_keys(config, chat_model, logger):
+        return False
+
+    if not _validate_speaker_token(config, logger):
         return False
 
     stage("🎙️", "Transcript & audio")

@@ -115,17 +115,42 @@ def test_full_pipeline_aligns_diarizes_and_splits_by_speaker(env):
     assert env.model_calls == [{"batch_size": 16, "language": None}]
 
 
+def test_alignment_result_is_tightened_so_lines_do_not_run_on_over_silence(env):
+    env.words = [{"word": "how", "start": 0.0, "end": 0.4}, {"word": "are", "start": 0.4, "end": 0.7}, {"word": "you", "start": 0.7, "end": 9.0}]
+    env.word_speakers = ["SPEAKER_00"] * 3
+    out = _engine().transcribe(AUDIO, "en", None)
+    assert out.segments[0]["end"] < 2.0  # "you" is not allowed to last 8 s, so the line ends where the speech does
+    assert out.segments[0]["words"][-1]["end"] < 1.7
+
+
+def test_vad_speech_regions_cap_word_ends(env, monkeypatch):
+    env.words = [{"word": "how", "start": 0.0, "end": 0.4}, {"word": "are", "start": 0.4, "end": 0.9}, {"word": "you", "start": 0.9, "end": 1.9}]
+    env.word_speakers = ["SPEAKER_00"] * 3
+    monkeypatch.setattr(Transcriber, "_speech_regions", lambda self, audio: [(0.0, 1.2)])  # the VAD heard speech only until 1.2 s
+    out = _engine().transcribe(AUDIO, "en", None)
+    assert out.segments[0]["words"][-1]["end"] <= 1.2 + 0.25 + 1e-6
+
+
+def test_a_vad_that_cannot_be_asked_is_not_fatal(env):
+    logs = []
+    engine = _engine(logs)
+    assert engine._speech_regions(AUDIO) is None  # the fake whisperx has no VAD: reported, not raised
+    assert any("Speech regions unavailable" in line for line in logs)
+    out = engine.transcribe(AUDIO, "en", None)
+    assert out.segments and not out.align_failed  # word-length limits still apply
+
+
 def test_small_gpus_use_a_smaller_batch(env, monkeypatch):
     monkeypatch.setattr(transcriber, "get_hardware_status", lambda: {"vram_gb": 4.0})
     _engine().transcribe(AUDIO, "en")
     assert env.model_calls[0]["batch_size"] == transcriber.LOW_VRAM_BATCH_SIZE
 
 
-def test_without_a_token_speakers_are_skipped_with_a_warning(env):
+def test_without_a_token_speakers_are_skipped_silently(env):
     logs = []
     out = _engine(logs).transcribe(AUDIO, "en", None)
     assert not out.diarized and out.speakers == [] and env.diarizer_created == 0
-    assert any("No HuggingFace token" in line for line in logs)
+    assert not any("token" in line.lower() for line in logs)  # speaker detection is opt-in: nothing to warn about
 
 
 def test_diarization_failure_degrades_instead_of_failing(env):

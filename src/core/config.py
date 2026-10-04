@@ -50,7 +50,8 @@ def get_default_config() -> Dict[str, Any]:
             "min_clip_score": 6,
             "review_boundaries": True,
             "deepseek_thinking": True,
-            "use_transcript_cache": True
+            "use_transcript_cache": True,
+            "speaker_diarization": False
         },
         "active_ai_provider": "openai",
         "openai_model": "gpt-5.5",
@@ -165,6 +166,7 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             settings.setdefault("review_boundaries", True)
             settings.setdefault("deepseek_thinking", True)
             settings.setdefault("use_transcript_cache", True)
+            settings.setdefault("speaker_diarization", False)
             
             openai_cfg = cfg.setdefault("openai", {})
             openai_cfg.setdefault("base_url", "")

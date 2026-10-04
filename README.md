@@ -15,7 +15,7 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
 
 ### 🎙️ Audio Intelligence & Local Whisper
 * **100% Free Local GPU Transcription:** Runs **WhisperX** (batched faster-whisper + wav2vec2 word alignment + pyannote speaker diarization) on your NVIDIA GPU (`cuda` / `float16`) or on the CPU (`int8`). Every faster-whisper model is selectable in Settings (`tiny` ... `large-v3`, `large-v3-turbo`, `distil-*`). Zero transcription API costs.
-* **Speaker Labels (always on):** the transcript knows *who* is talking (`SPEAKER_00`, `SPEAKER_01`, ...) and the AI uses it to keep question + answer and joke + reaction together. Needs a free HuggingFace token with the terms of `pyannote/speaker-diarization-community-1` accepted (Settings -> HuggingFace Token, the `HF_TOKEN` environment variable or `data/.hf_token`). Without a token transcripts are made without speakers and a warning is logged.
+* **Speaker Labels (optional, off by default):** the transcript can say *who* is talking (`SPEAKER_00`, `SPEAKER_01`, ...) and the AI uses it to keep question + answer and joke + reaction together. Turn it on in Settings -> Speaker detection; it needs a free HuggingFace token (how to get one: section "Speaker detection: getting a HuggingFace token" below). With it on and no token the app refuses to start a job instead of silently skipping speakers.
 * **Deterministic Disk Caching:** Transcriptions are hashed and cached on disk (`data/transcripts/`). Re-analyzing or re-cutting a video with different prompts takes seconds without re-transcribing. It can be switched off globally in Settings (**Use transcript cache**, on by default).
 * **Local-Baseline Loudness:** Every transcript line gets `[LOUDNESS: X%]` measured against the *surrounding* background level (rolling ±30 s median), not the global maximum, so one huge scream no longer flattens the rest of the stream.
 * **Laughter / Scream Detection (YAMNet on GPU):** Whisper does not transcribe laughter, so the audio is also run through Google's pretrained **YAMNet** AudioSet classifier (16 MB ONNX model, `onnxruntime-gpu`). Confident laughter / screaming / shouting frames become standalone `[LAUGHTER 60%]` / `[SCREAM 45%]` lines in the transcript (the percentage is the classifier's confidence, so 30-50% is already a real signal); short peaks 18+ dB over the local background add `[LOUD 60%]`. A 90-minute VOD is classified in ~2 s on an RTX GPU.
@@ -198,6 +198,24 @@ This target executes:
 2. Sort extracted clips by **Date** or **Virality Score**.
 3. Select any item to view generated thumbnails, audio duration, and the AI's written justification.
 4. Click **▶️ Play Clip** to preview the cut in your default media player.
+
+---
+
+## 🗣️ Speaker detection: getting a HuggingFace token
+
+Speaker detection (diarization) uses the `pyannote/speaker-diarization-community-1` model. It is free, but the model is *gated*: you need a HuggingFace account, you must accept the model's terms once, and the app needs an access token. It is optional; everything else works without it.
+
+1. **Create a free account** at <https://huggingface.co/join> (or log in).
+2. **Accept the model terms.** Open <https://huggingface.co/pyannote/speaker-diarization-community-1>, fill in the short form if it asks and press **Agree and access repository**. Without this step the download fails with a 401 / 403 error even with a valid token.
+3. **Create a token.** Open <https://huggingface.co/settings/tokens>, press **Create new token**, choose the type **Read**, give it any name (for example `clipgen`) and press **Create token**. Copy the token now (it starts with `hf_` and is shown only once).
+4. **Paste it into the app.** Settings -> **Speaker detection**: tick **Detect speakers**, paste the token into **HuggingFace token** (the field unlocks when the box is ticked) and press **Save settings**. The *Get a token* button opens the token page.
+
+Notes:
+* The first run downloads the diarization models (a few hundred MB) into `data/models/huggingface`.
+* Instead of the field you can set the `HF_TOKEN` environment variable or put the token into a file `data/.hf_token`.
+* With the box ticked and no token anywhere the app will not start processing and tells you why; untick the box to work without speakers.
+* Speaker detection adds time and memory on long streams (the whole recording is processed at once). If it fails, the transcript is made without speakers and the reason is logged.
+* A leaked token can be revoked on the same tokens page. The token is stored in plain text in `config.json` (git-ignored).
 
 ---
 
