@@ -19,7 +19,7 @@ P = ls.PALETTE
     ("🔊 Audio events stored in the cache: LAUGHTER: 15, LOUD: 22, SCREAM: 2 (sound classifier not re-run).", "audio"),
     ("⬇️ Downloading the YAMNet sound-event model (16 MB, one time)...", "audio"),
     ("♻️ Found an older cached transcript (649 segments) - reusing the Whisper text...", "audio"),
-    ("🤖 Routing to DeepSeek Engine (deepseek-v4-flash) with 999 segments...", "ai"),
+    ("🤖 Routing to DeepSeek Engine (deepseek-flash) with 999 segments...", "ai"),
     ("🧠 DeepSeek reasoning mode: ON (slower, better decisions), 4 requests in parallel.", "ai"),
     ("🏷️ Audio event tags included in the AI prompts: LAUGHTER: 15.", "ai"),
     ("🎯 Window 1/8: 5 candidate(s) (34s)", "ai"),

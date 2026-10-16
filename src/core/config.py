@@ -58,13 +58,13 @@ def get_default_config() -> Dict[str, Any]:
         "anthropic_model": "claude-sonnet-5",
         "google_model": "gemini-3.5-flash",
         "xai_model": "grok-4.3",
-        "deepseek_model": "deepseek-v4-flash",
+        "deepseek_model": "deepseek-flash",
         "cached_models": [
             "gpt-5.5", "gpt-4o-mini",
             "gemini-3.5-flash", "gemini-3-pro",
             "claude-sonnet-5", "claude-haiku-4-5-20251001",
             "grok-4.3", "grok-4-1-fast-non-reasoning",
-            "deepseek-v4-flash", "deepseek-v4-pro"
+            "deepseek-flash", "deepseek-v4-pro"
         ],
         "prompts": {
             "active_profile": "Default", 
@@ -182,16 +182,16 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             # Migration/Defaults for new multi-provider UI
             cfg.setdefault("active_ai_provider", "openai")
             cfg.setdefault("openai_model", "gpt-5.5")
-            cfg.setdefault("deepseek_model", "deepseek-v4-flash")
+            cfg.setdefault("deepseek_model", "deepseek-flash")
             cfg.setdefault("anthropic_model", "claude-sonnet-5")
             cfg.setdefault("google_model", "gemini-3.5-flash")
             cfg.setdefault("xai_model", "grok-4.3")
             
-            # Migrate retired DeepSeek models (deepseek-chat, deepseek-reasoner -> deepseek-v4-flash)
-            if cfg.get("deepseek_model") in ["deepseek-chat", "deepseek-reasoner"]:
-                cfg["deepseek_model"] = "deepseek-v4-flash"
-            if cfg.get("openai_model") in ["deepseek-chat", "deepseek-reasoner"]:
-                cfg["openai_model"] = "deepseek-v4-flash"
+            # Migrate retired DeepSeek models (deepseek-chat, deepseek-reasoner, deepseek-v4-flash -> deepseek-flash)
+            if cfg.get("deepseek_model") in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]:
+                cfg["deepseek_model"] = "deepseek-flash"
+            if cfg.get("openai_model") in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]:
+                cfg["openai_model"] = "deepseek-flash"
             
             # Migrate old chat_model to the correct field
             old_chat_model = cfg.get("openai", {}).get("chat_model")
@@ -206,8 +206,8 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
                     cfg["xai_model"] = old_chat_model
                     cfg["active_ai_provider"] = "xai"
                 elif "deepseek" in old_chat_model:
-                    if old_chat_model in ["deepseek-chat", "deepseek-reasoner"]:
-                        cfg["deepseek_model"] = "deepseek-v4-flash"
+                    if old_chat_model in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]:
+                        cfg["deepseek_model"] = "deepseek-flash"
                     else:
                         cfg["deepseek_model"] = old_chat_model
                     cfg["active_ai_provider"] = "deepseek"
@@ -217,9 +217,9 @@ def load_config(filepath: Optional[str] = None) -> Dict[str, Any]:
             
             # Update cached_models
             cached_models = cfg.get("cached_models", [])
-            if any(m in ["deepseek-chat", "deepseek-reasoner"] for m in cached_models):
-                updated_models = [m for m in cached_models if m not in ["deepseek-chat", "deepseek-reasoner"]]
-                for model in ["deepseek-v4-flash", "deepseek-v4-pro"]:
+            if any(m in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"] for m in cached_models):
+                updated_models = [m for m in cached_models if m not in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]]
+                for model in ["deepseek-flash", "deepseek-v4-pro"]:
                     if model not in updated_models:
                         updated_models.append(model)
                 cfg["cached_models"] = updated_models

@@ -541,7 +541,7 @@ class ClipGenApp(ctk.CTk):
 
         self.deepseek_model_label = ctk.CTkLabel(self.deepseek_frame, text="AI Model:", font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_secondary"])
         self.deepseek_model_menu = ctk.CTkComboBox(self.deepseek_frame, cursor="hand2", values=model_fetcher.MAIN_MODELS["deepseek"], height=32, width=260)
-        self.deepseek_model_menu.set(self.config.get("deepseek_model", "deepseek-v4-flash"))
+        self.deepseek_model_menu.set(self.config.get("deepseek_model", "deepseek-flash"))
 
         # 3. Anthropic
         self.anthropic_frame = ctk.CTkFrame(self.api_card, fg_color=THEME["bg_card_alt"], corner_radius=8)

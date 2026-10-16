@@ -40,7 +40,7 @@ An automated, hardware-accelerated, AI-driven highlight extraction and video cli
   * **Anthropic Claude:** `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`.
   * **OpenAI:** `gpt-5.5`, `gpt-5.4`, `gpt-4o`, `gpt-4o-mini`.
   * **xAI:** `grok-4.3`, `grok-4.6`, `grok-4-1-fast-*`.
-  * **DeepSeek & OpenRouter:** `deepseek-v4-flash`, `deepseek-v4-pro`, or any custom OpenAI-compatible endpoint.
+  * **DeepSeek & OpenRouter:** `deepseek-flash`, `deepseek-v4-pro`, or any custom OpenAI-compatible endpoint.
 * **Dynamic Model Discovery:** Automatically queries provider endpoints in the background to keep the model picker updated with the latest available releases.
 * **Configurable Prompt Profiles:** The built-in Default prompt documents the audio tags, decides clip length purely by content (no target or maximum-length anchor: clips range from a few seconds to a few minutes), has an explicit cutting section and worked examples, an absolute 1-10 rubric, and `"clip it"` voice-command recognition. The protected Default profile is re-synced from the codebase on every launch; custom profiles are left untouched.
 
@@ -238,7 +238,7 @@ Everything the app stores lives inside the project folder (nothing is kept in yo
 | :--- | :--- | :--- | :--- |
 | **Google** | `gemini-3.5-flash` | **All-round Best** | Large context and fast; windowed analysis keeps quality high on 4+ hour VODs. |
 | **Anthropic** | `claude-sonnet-5` | **High Precision** | Exceptional nuanced comedy and banter comprehension. |
-| **DeepSeek** | `deepseek-v4-flash` | **Budget / Value** | Cost-effective extraction via official API or OpenRouter. |
+| **DeepSeek** | `deepseek-flash` | **Budget / Value** | Cost-effective extraction via official API or OpenRouter. |
 | **OpenAI** | `gpt-5.5` | **General Gaming** | Ensure your account tier supports large token requests. |
 | **xAI** | `grok-4.3` | **Edgy / Fast Comedy** | Strong grasp of chaotic banter and sarcasm. |
 

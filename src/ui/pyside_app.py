@@ -1324,7 +1324,7 @@ class ClipGenPySideApp(QtWidgets.QMainWindow):
             "DeepSeek Cloud Intelligence", "deepseek", active_prov,
             self.config.get("deepseek", {}).get("api_key", ""),
             model_fetcher.MAIN_MODELS["deepseek"],
-            self.config.get("deepseek_model", "deepseek-v4-flash"),
+            self.config.get("deepseek_model", "deepseek-flash"),
             "",
             self._test_deepseek_key
         )

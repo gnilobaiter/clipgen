@@ -28,7 +28,7 @@ MAIN_MODELS = {
         "gemini-2.5-flash", "gemini-2.5-pro"
     ],
     "xai": ["grok-4.3", "grok-4.6", "grok-4-1-fast-non-reasoning", "grok-4-1-fast-reasoning"],
-    "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"]
+    "deepseek": ["deepseek-flash", "deepseek-v4-pro"]
 }
 
 # Keywords for filtering common chat models (if not using whitelisted-only)

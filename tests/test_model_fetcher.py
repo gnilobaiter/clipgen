@@ -10,7 +10,7 @@ from src.services import model_fetcher
     ("gemini-1.5-pro", True),
     ("openrouter/google/gemini-pro", True),
     ("deepseek-chat", True),
-    ("deepseek-v4-flash", True),
+    ("deepseek-flash", True),
     ("deepseek-v4-pro", True),
     ("text-embedding-3-small", False),
     ("text-embedding-ada-002", False),
@@ -71,7 +71,7 @@ def test_fetch_deepseek_models_empty_key():
 
 def test_fetch_deepseek_models_success(monkeypatch):
     mock_client = MagicMock()
-    mock_model1 = MagicMock(id="deepseek-v4-flash")
+    mock_model1 = MagicMock(id="deepseek-flash")
     mock_model2 = MagicMock(id="deepseek-v4-pro")
     mock_model3 = MagicMock(id="text-embedding-ds")
     mock_client.models.list.return_value = [mock_model1, mock_model2, mock_model3]
@@ -79,7 +79,7 @@ def test_fetch_deepseek_models_success(monkeypatch):
     monkeypatch.setattr("src.services.model_fetcher.OpenAI", lambda **kwargs: mock_client)
 
     models = model_fetcher.fetch_deepseek_models("fake_key")
-    assert models == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert models == ["deepseek-flash", "deepseek-v4-pro"]
 
 
 def test_fetch_deepseek_models_error(monkeypatch):
@@ -182,14 +182,14 @@ def test_fetch_all_available_models(monkeypatch):
     }
 
     monkeypatch.setattr(model_fetcher, "fetch_openai_models", lambda *args, **kwargs: ["gpt-4o"])
-    monkeypatch.setattr(model_fetcher, "fetch_deepseek_models", lambda *args, **kwargs: ["deepseek-v4-flash"])
+    monkeypatch.setattr(model_fetcher, "fetch_deepseek_models", lambda *args, **kwargs: ["deepseek-flash"])
     monkeypatch.setattr(model_fetcher, "fetch_anthropic_models", lambda *args, **kwargs: ["claude-3-5-sonnet-latest"])
     monkeypatch.setattr(model_fetcher, "fetch_xai_models", lambda *args, **kwargs: ["grok-2-latest"])
     monkeypatch.setattr(model_fetcher, "fetch_google_models", lambda *args, **kwargs: ["gemini-2.5-flash"])
 
     all_models = model_fetcher.fetch_all_available_models(config)
     assert "gpt-4o" in all_models
-    assert "deepseek-v4-flash" in all_models
+    assert "deepseek-flash" in all_models
     assert "claude-3-5-sonnet-latest" in all_models
     assert "grok-2-latest" in all_models
     assert "gemini-2.5-flash" in all_models

@@ -104,9 +104,9 @@ def test_load_config_deepseek_migration(tmp_path):
     cfg_path.write_text(json.dumps(old_cfg_data), encoding="utf-8")
 
     config = load_config(filepath=str(cfg_path))
-    assert config["deepseek_model"] == "deepseek-v4-flash"
+    assert config["deepseek_model"] == "deepseek-flash"
     assert config["active_ai_provider"] == "deepseek"
-    assert "deepseek-v4-flash" in config["cached_models"]
+    assert "deepseek-flash" in config["cached_models"]
     assert "deepseek-v4-pro" in config["cached_models"]
     assert "deepseek-chat" not in config["cached_models"]
     assert "deepseek-reasoner" not in config["cached_models"]

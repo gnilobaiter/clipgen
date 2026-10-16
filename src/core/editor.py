@@ -1210,7 +1210,7 @@ def process_video(file_path: str, prompt_profile: str = "Default", logger: Optio
 
     active_prov = config.get("active_ai_provider", "openai")
     if active_prov == "deepseek":
-        chat_model = config.get("deepseek_model", "deepseek-v4-flash")
+        chat_model = config.get("deepseek_model", "deepseek-flash")
     elif active_prov == "anthropic":
         chat_model = config.get("anthropic_model", "claude-sonnet-5")
     elif active_prov == "google":
